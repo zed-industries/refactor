@@ -1,6 +1,6 @@
 # Programmatic Refactoring of Zed
 
-This tool is part of an ongoing effort to simplify context types in the GPUI framework and the Zed app that uses it. It's designed to automatically refactor Rust code, replacing `WindowContext` and `ViewContext` with explicit `Window` parameters along with `AppContext` or `ModelContext`. So far, the tool performs the following transformations:
+This tool is part of an ongoing effort to simplify context types in the GPUI framework and the Zed app that uses it. It's designed to automatically refactor Rust code, replacing `WindowContext` and `ViewContext` with explicit `Window` parameters along with `AppContext`. So far, the tool performs the following transformations:
 
 ## Function Signatures
 - Replaces `cx: &mut WindowContext` with `window: &mut Window, cx: &mut AppContext`
