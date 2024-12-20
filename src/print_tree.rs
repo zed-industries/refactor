@@ -1,5 +1,5 @@
 use std::fs;
-use tree_sitter::{Node, Parser, TreeCursor};
+use tree_sitter::{Node, Parser};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -8,7 +8,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    let filepath = &args[1];
     let filepath = fs::canonicalize(&args[1]).expect("Failed to canonicalize path");
     let source_code = fs::read_to_string(filepath).expect("Unable to read file");
 

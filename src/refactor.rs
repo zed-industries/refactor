@@ -1,32 +1,222 @@
-use std::collections::HashSet;
-use std::fs;
-use std::io::Write;
+use clap::Parser as ClapParser;
+use std::{collections::HashSet, fs, io::Write};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::QueryMatch;
-use tree_sitter::{Language, Parser, Query, QueryCursor};
+use tree_sitter::{Parser, Query, QueryCursor};
 use walkdir::WalkDir;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <path>", args[0]);
-        std::process::exit(1);
-    }
+#[derive(ClapParser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Path to the directory or file to refactor
+    #[clap(value_parser)]
+    path: String,
 
-    let language: Language = tree_sitter_rust::LANGUAGE.into();
+    /// Perform a dry run (show potential changes without applying them)
+    #[clap(long, action)]
+    dry_run: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    let path = std::fs::canonicalize(&args.path).expect("Failed to canonicalize path");
+    let relative_path = path
+        .strip_prefix(std::env::current_dir().unwrap())
+        .unwrap_or(&path);
 
     let mut parser = Parser::new();
     parser
-        .set_language(&language)
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
         .expect("Error loading Rust grammar");
 
-    let function_query = Query::new(&language, get_function_query_string())
+    for entry in WalkDir::new(relative_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.path().extension().map_or(false, |ext| ext == "rs") {
+            let source = fs::read_to_string(entry.path()).unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let root_node = tree.root_node();
+
+            let mut edits = Vec::new();
+
+            // Process imports
+            process_imports(&source, &mut parser, &mut edits);
+
+            process_functions(&source, root_node, &mut edits);
+
+            // Sort edits in reverse order of their start positions
+            edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+            // Deduplicate edits with identical ranges
+            edits.dedup_by(|(start1, end1, _), (start2, end2, _)| start1 == start2 && end1 == end2);
+
+            let mut last_end = 0;
+            for (start, end, _) in edits.iter() {
+                if *start < last_end {
+                    println!("Warning: Overlapping edits detected!");
+                    break;
+                }
+                last_end = *end;
+            }
+
+            if args.dry_run {
+                display_dry_run_results(entry.path(), &source, &edits);
+            } else {
+                // Apply edits in reverse order
+                let mut updated_source = source.clone();
+                for (start, end, replacement) in edits.iter() {
+                    let line_number = updated_source[..*start].lines().count();
+                    println!(
+                        "Line {}: Replacing '{}' with '{}'",
+                        line_number,
+                        &updated_source[*start..*end],
+                        replacement
+                    );
+                    updated_source.replace_range(*start..*end, replacement);
+                }
+
+                // Write the updated content back to the file
+                let mut file = fs::File::create(entry.path()).unwrap();
+                file.write_all(updated_source.as_bytes()).unwrap();
+
+                println!("Updated file: {}", entry.path().display());
+            }
+        }
+    }
+}
+
+fn process_functions(
+    source: &str,
+    root_node: tree_sitter::Node,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    let function_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), function_query())
         .expect("Failed to create function query");
-
-    let method_call_query = Query::new(&language, get_method_call_query_string())
+    let method_call_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), method_call_query())
         .expect("Failed to create method call query");
+    let window_methods = get_window_methods();
 
-    let window_methods: HashSet<&str> = [
+    let mut function_query_cursor = QueryCursor::new();
+    let mut matches = function_query_cursor.matches(&function_query, root_node, source.as_bytes());
+
+    let function_name_index = function_query
+        .capture_index_for_name("function_name")
+        .unwrap();
+    let param_name_index = function_query.capture_index_for_name("param_name").unwrap();
+    let param_type_index = function_query.capture_index_for_name("param_type").unwrap();
+    let target_param_index = function_query
+        .capture_index_for_name("target_param")
+        .unwrap();
+    let function_body_index = function_query
+        .capture_index_for_name("function_body")
+        .unwrap();
+    println!("Function query capture indices:");
+    println!("  function_name: {}", function_name_index);
+    println!("  param_name: {}", param_name_index);
+    println!("  param_type: {}", param_type_index);
+    println!("  target_param: {}", target_param_index);
+    println!("  function_body: {}", function_body_index);
+
+    let object_index = method_call_query.capture_index_for_name("object").unwrap();
+    let method_index = method_call_query.capture_index_for_name("method").unwrap();
+    println!("Method call query capture indices:");
+    println!("  object: {}", object_index);
+    println!("  method: {}", method_index);
+
+    while let Some(match_) = matches.next() {
+        if match_.captures.is_empty() {
+            continue;
+        }
+
+        let mut param_name = "";
+        let mut target_param_start = None;
+        let mut target_param_end = None;
+        let mut function_body_node = None;
+
+        for capture in match_.captures {
+            match capture.index {
+                i if i == function_name_index => {}
+                i if i == param_name_index => {
+                    param_name = &source[capture.node.byte_range()];
+                }
+                i if i == param_type_index => {}
+                i if i == target_param_index => {
+                    target_param_start = Some(capture.node.start_byte());
+                    target_param_end = Some(capture.node.end_byte());
+                }
+                i if i == function_body_index => {
+                    function_body_node = Some(capture.node);
+                }
+                _ => {}
+            }
+        }
+
+        let is_function_type = match_
+            .captures
+            .iter()
+            .any(|c| c.node.kind() == "function_type");
+
+        if is_function_type {
+            if let Some((start, end)) = target_param_start.zip(target_param_end) {
+                let new_param = if is_function_type {
+                    "&mut Window, &mut AppContext"
+                } else {
+                    "window: &mut Window, cx: &mut AppContext"
+                };
+
+                edits.push((start, end, new_param.to_string()));
+            }
+        } else {
+            if let (Some(start), Some(end)) = (target_param_start, target_param_end) {
+                edits.push((
+                    start,
+                    end,
+                    "window: &mut Window, cx: &mut AppContext".to_string(),
+                ));
+
+                if let Some(body_node) = function_body_node {
+                    let mut method_call_cursor = QueryCursor::new();
+                    let mut method_calls = method_call_cursor.matches(
+                        &method_call_query,
+                        body_node,
+                        source.as_bytes(),
+                    );
+
+                    while let Some(method_call) = method_calls.next() {
+                        let object = method_call
+                            .captures
+                            .iter()
+                            .find(|c| c.index == object_index);
+                        let method = method_call
+                            .captures
+                            .iter()
+                            .find(|c| c.index == method_index);
+
+                        if let (Some(object), Some(method)) = (object, method) {
+                            if &source[object.node.byte_range()] == param_name {
+                                let method_name = &source[method.node.byte_range()];
+                                let new_object = if window_methods.contains(method_name) {
+                                    "window"
+                                } else {
+                                    "cx"
+                                };
+
+                                edits.push((
+                                    object.node.start_byte(),
+                                    object.node.end_byte(),
+                                    new_object.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn get_window_methods() -> HashSet<&'static str> {
+    [
         "window_handle",
         "refresh",
         "notify",
@@ -89,59 +279,26 @@ fn main() {
     ]
     .iter()
     .cloned()
-    .collect();
+    .collect()
+}
 
-    let path = std::fs::canonicalize(&args[1]).expect("Failed to canonicalize path");
-    let relative_path = path
-        .strip_prefix(std::env::current_dir().unwrap())
-        .unwrap_or(&path);
+fn display_dry_run_results(path: &std::path::Path, source: &str, edits: &[(usize, usize, String)]) {
+    return;
+    println!("Potential changes for file: {}", path.display());
+    for (start, end, replacement) in edits.iter() {
+        let start_line = source[..*start].lines().count();
+        let end_line = source[..*end].lines().count();
+        let context_start = source[..*start].rfind('\n').map_or(0, |i| i + 1);
+        let _context_end = source[*end..].find('\n').map_or(source.len(), |i| *end + i);
 
-    for entry in WalkDir::new(relative_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.path().extension().map_or(false, |ext| ext == "rs") {
-            let mut source = fs::read_to_string(entry.path()).unwrap();
-            let tree = parser.parse(&source, None).unwrap();
-            let root_node = tree.root_node();
-
-            let mut edits = Vec::new();
-
-            // Process imports
-            process_imports(&source, &mut parser, &mut edits);
-
-            let mut function_query_cursor = QueryCursor::new();
-            let mut matches =
-                function_query_cursor.matches(&function_query, root_node, source.as_bytes());
-
-            while let Some(match_) = matches.next() {
-                process_function_match(
-                    match_,
-                    &source,
-                    &method_call_query,
-                    &window_methods,
-                    &mut edits,
-                );
-            }
-
-            // Sort edits in reverse order of their start positions
-            edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
-
-            // Apply edits in reverse order
-            for (start, end, replacement) in edits.into_iter() {
-                source.replace_range(start..end, &replacement);
-            }
-
-            // Write the updated content back to the file
-            let mut file = fs::File::create(entry.path()).unwrap();
-            file.write_all(source.as_bytes()).unwrap();
-
-            println!("Updated file: {}", entry.path().display());
-        }
+        println!("Lines {}-{}:", start_line, end_line);
+        println!("- {}", &source[context_start..*end]);
+        println!("+ {}{}", &source[context_start..*start], replacement);
+        println!();
     }
 }
 
-fn get_function_query_string() -> &'static str {
+fn function_query() -> &'static str {
     r#"
         [
           (function_item
@@ -150,53 +307,64 @@ fn get_function_query_string() -> &'static str {
               (parameter
                 pattern: (identifier) @param_name
                 type: (reference_type
-                  (mutable_specifier)
-                  type: [
-                    (type_identifier) @param_type
-                    (scoped_type_identifier
-                      name: (type_identifier) @param_type)
-                  ]
+                  (mutable_specifier)?
+                  type: (type_identifier) @param_type
                 )
               ) @target_param
-              (#eq? @param_type "WindowContext")
             )
             body: (block) @function_body
           )
+          (#eq? @param_type "WindowContext")
           (function_signature_item
             name: (identifier) @function_name
             parameters: (parameters
               (parameter
                 pattern: (identifier) @param_name
                 type: (reference_type
-                  (mutable_specifier)
-                  type: [
-                    (type_identifier) @param_type
-                    (scoped_type_identifier
-                      name: (type_identifier) @param_type)
-                  ]
+                  (mutable_specifier)?
+                  type: (type_identifier) @param_type
                 )
               ) @target_param
-              (#eq? @param_type "WindowContext")
             )
           )
+          (#eq? @param_type "WindowContext")
           (function_type
             parameters: (parameters
               (reference_type
-                (mutable_specifier)
-                type: [
-                  (type_identifier) @param_type
-                  (scoped_type_identifier
-                    name: (type_identifier) @param_type)
-                ]
+                (mutable_specifier)?
+                type: (generic_type
+                  type: (type_identifier) @param_type
+                  type_arguments: (type_arguments
+                    (lifetime)?
+                  )
+                )
               ) @target_param
-              (#eq? @param_type "WindowContext")
             )
           )
+          (#eq? @param_type "WindowContext")
+          (impl_item
+            body: (declaration_list
+              (function_item
+                name: (identifier) @function_name
+                parameters: (parameters
+                  (self_parameter)?
+                  (parameter
+                    type: (reference_type
+                      (mutable_specifier)?
+                      type: (type_identifier) @param_type
+                    )
+                  ) @target_param
+                )
+                body: (block) @function_body
+              )
+            )
+          )
+          (#eq? @param_type "WindowContext")
         ]
     "#
 }
 
-fn get_method_call_query_string() -> &'static str {
+fn method_call_query() -> &'static str {
     r#"
         (call_expression
             function: (field_expression
@@ -204,29 +372,6 @@ fn get_method_call_query_string() -> &'static str {
                 field: (field_identifier) @method
             )
         )
-    "#
-}
-
-fn get_import_query_string() -> &'static str {
-    r#"
-    (use_declaration
-      argument: [
-        (scoped_identifier
-          path: (_) @path
-          name: (identifier) @import_name
-        )
-        (scoped_use_list
-          path: (_) @path
-          list: (use_list
-            (identifier) @import_name
-          )
-        )
-        (use_list
-          (identifier) @import_name
-        )
-      ]
-      (#eq? @import_name "WindowContext")
-    )
     "#
 }
 
@@ -267,14 +412,12 @@ fn process_imports(source: &str, parser: &mut Parser, edits: &mut Vec<(usize, us
     let mut app_context_imported = false;
 
     while let Some(match_) = matches.next() {
-        let mut path = "";
         let mut import_name = "";
         let mut import_start = 0;
         let mut import_end = 0;
 
         for capture in match_.captures {
             match import_query.capture_names()[capture.index as usize] {
-                "path" => path = &source[capture.node.byte_range()],
                 "import_name" => {
                     import_name = &source[capture.node.byte_range()];
                     import_start = capture.node.start_byte();
@@ -304,82 +447,5 @@ fn process_imports(source: &str, parser: &mut Parser, edits: &mut Vec<(usize, us
             edits.push((start, end, "AppContext".to_string()));
         }
         // If both are already imported, we don't need to do anything
-    }
-}
-
-fn process_function_match(
-    match_: &QueryMatch,
-    source: &str,
-    method_call_query: &Query,
-    window_methods: &HashSet<&str>,
-    edits: &mut Vec<(usize, usize, String)>,
-) {
-    let mut param_name = "";
-    let mut target_param_start = 0;
-    let mut target_param_end = 0;
-    let mut function_body_node = None;
-
-    for capture in match_.captures {
-        match capture.index as usize {
-            1 => param_name = &source[capture.node.byte_range()],
-            3 => {
-                target_param_start = capture.node.start_byte();
-                target_param_end = capture.node.end_byte();
-            }
-            4 => {
-                function_body_node = Some(capture.node);
-            }
-            _ => {}
-        }
-    }
-
-    // Check if it's a function type
-    let is_function_type = match_
-        .captures
-        .iter()
-        .any(|c| c.node.kind() == "function_type");
-
-    if is_function_type {
-        // Replace the WindowContext parameter for function types
-        edits.push((
-            target_param_start,
-            target_param_end,
-            "&mut Window, &mut AppContext".to_string(),
-        ));
-    } else {
-        // Replace the WindowContext parameter for regular functions
-        edits.push((
-            target_param_start,
-            target_param_end,
-            "window: &mut Window, cx: &mut AppContext".to_string(),
-        ));
-
-        // Update the function body
-        if let Some(body_node) = function_body_node {
-            let mut method_call_cursor = QueryCursor::new();
-            let mut method_calls =
-                method_call_cursor.matches(method_call_query, body_node, source.as_bytes());
-
-            while let Some(method_call) = method_calls.next() {
-                for capture in method_call.captures {
-                    if capture.index == 0 {
-                        if &source[capture.node.byte_range()] == param_name {
-                            let method_node = method_call.captures[1].node;
-                            let method_name = &source[method_node.byte_range()];
-                            let new_object = if window_methods.contains(method_name) {
-                                "window"
-                            } else {
-                                "cx"
-                            };
-                            edits.push((
-                                capture.node.start_byte(),
-                                capture.node.end_byte(),
-                                new_object.to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
     }
 }

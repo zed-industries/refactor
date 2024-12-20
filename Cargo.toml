@@ -13,6 +13,8 @@ name = "print_tree"
 path = "src/print_tree.rs"
 
 [dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+lazy_static = "1.5.0"
 streaming-iterator = "0.1.9"
 tree-sitter = "0.24.5"
 tree-sitter-rust = "0.23.2"
