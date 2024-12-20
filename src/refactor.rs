@@ -1,5 +1,5 @@
 use clap::Parser as ClapParser;
-use std::{collections::HashSet, fs, io::Write};
+use std::{collections::HashMap, fs, io::Write};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 use walkdir::WalkDir;
@@ -92,10 +92,8 @@ fn process_functions(
 ) {
     let function_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), function_query())
         .expect("Failed to create function query");
-    let method_call_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), method_call_query())
-        .expect("Failed to create method call query");
-    let argument_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), argument_query())
-        .expect("Failed to create argument query");
+    let call_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), call_query())
+        .expect("Failed to create call query");
     let window_methods = get_window_methods();
 
     let mut function_query_cursor = QueryCursor::new();
@@ -112,26 +110,6 @@ fn process_functions(
     let function_body_index = function_query
         .capture_index_for_name("function_body")
         .unwrap();
-    println!("Function query capture indices:");
-    println!("  function_name: {}", function_name_index);
-    println!("  param_name: {}", param_name_index);
-    println!("  param_type: {}", param_type_index);
-    println!("  target_param: {}", target_param_index);
-    println!("  function_body: {}", function_body_index);
-
-    let object_index = method_call_query.capture_index_for_name("object").unwrap();
-    let method_index = method_call_query.capture_index_for_name("method").unwrap();
-    println!("Method call query capture indices:");
-    println!("  object: {}", object_index);
-    println!("  method: {}", method_index);
-
-    let argument_index = argument_query.capture_index_for_name("argument").unwrap();
-    let function_name_index_arg = argument_query
-        .capture_index_for_name("function_name")
-        .unwrap();
-    println!("Argument query capture indices:");
-    println!("  argument: {}", argument_index);
-    println!("  function_name: {}", function_name_index_arg);
 
     while let Some(match_) = matches.next() {
         if match_.captures.is_empty() {
@@ -185,68 +163,48 @@ fn process_functions(
                 ));
 
                 if let Some(body_node) = function_body_node {
-                    let mut method_call_cursor = QueryCursor::new();
-                    let mut method_calls = method_call_cursor.matches(
-                        &method_call_query,
-                        body_node,
-                        source.as_bytes(),
-                    );
+                    let mut call_cursor = QueryCursor::new();
+                    let mut calls = call_cursor.matches(&call_query, body_node, source.as_bytes());
 
-                    while let Some(method_call) = method_calls.next() {
-                        let object = method_call
-                            .captures
-                            .iter()
-                            .find(|c| c.index == object_index);
-                        let method = method_call
-                            .captures
-                            .iter()
-                            .find(|c| c.index == method_index);
+                    while let Some(call) = calls.next() {
+                        let func = call.captures.iter().find(|c| {
+                            c.index == call_query.capture_index_for_name("func").unwrap()
+                        });
+                        let object = call.captures.iter().find(|c| {
+                            c.index == call_query.capture_index_for_name("object").unwrap()
+                        });
+                        let method = call.captures.iter().find(|c| {
+                            c.index == call_query.capture_index_for_name("method").unwrap()
+                        });
+                        let args = call.captures.iter().find(|c| {
+                            c.index == call_query.capture_index_for_name("args").unwrap()
+                        });
 
-                        if let (Some(object), Some(method)) = (object, method) {
-                            if &source[object.node.byte_range()] == param_name {
+                        if let Some(args) = args {
+                            if let (Some(object), Some(method)) = (object, method) {
+                                // Handle object method calls
+                                let object_text = &source[object.node.byte_range()];
                                 let method_name = &source[method.node.byte_range()];
-                                let new_object = if window_methods.contains(method_name) {
-                                    "window"
-                                } else {
-                                    "cx"
-                                };
 
-                                edits.push((
-                                    object.node.start_byte(),
-                                    object.node.end_byte(),
-                                    new_object.to_string(),
-                                ));
-                            }
-                        }
-                    }
+                                if object_text == param_name {
+                                    if let Some(&needs_cx) = window_methods.get(method_name) {
+                                        edits.push((
+                                            object.node.start_byte(),
+                                            object.node.end_byte(),
+                                            "window".to_string(),
+                                        ));
 
-                    let mut argument_cursor = QueryCursor::new();
-                    let mut arguments =
-                        argument_cursor.matches(&argument_query, body_node, source.as_bytes());
-
-                    while let Some(argument_match) = arguments.next() {
-                        let argument = argument_match
-                            .captures
-                            .iter()
-                            .find(|c| c.index == argument_index);
-                        let function_name = argument_match
-                            .captures
-                            .iter()
-                            .find(|c| c.index == function_name_index_arg);
-
-                        if let (Some(argument), Some(function_name)) = (argument, function_name) {
-                            if &source[argument.node.byte_range()] == param_name {
-                                let function = &source[function_name.node.byte_range()];
-                                println!(
-                                    "Found '{}' passed as argument to function '{}'",
-                                    param_name, function
-                                );
-
-                                edits.push((
-                                    argument.node.start_byte(),
-                                    argument.node.end_byte(),
-                                    "window, cx".to_string(),
-                                ));
+                                        if needs_cx {
+                                            add_cx_to_args(source, args, edits);
+                                        }
+                                    }
+                                }
+                            } else if let Some(func) = func {
+                                // Handle regular function calls
+                                let func_name = &source[func.node.byte_range()];
+                                if func_name == param_name {
+                                    replace_args_with_window_and_cx(source, args, edits);
+                                }
                             }
                         }
                     }
@@ -256,145 +214,145 @@ fn process_functions(
     }
 }
 
-fn get_window_methods() -> HashSet<&'static str> {
+fn get_window_methods() -> HashMap<&'static str, bool> {
     [
-        "window_handle",
-        "refresh",
-        "notify",
-        "remove_window",
-        "focused",
-        "focus",
-        "blur",
-        "disable_focus",
-        "text_system",
-        "text_style",
-        "is_maximized",
-        "request_decorations",
-        "start_window_resize",
-        "window_bounds",
-        "dispatch_action",
-        "defer",
-        "observe",
-        "subscribe",
-        "observe_release",
-        "to_async",
-        "on_next_frame",
-        "request_animation_frame",
-        "spawn",
-        "bounds_changed",
-        "bounds",
-        "is_fullscreen",
-        "appearance_changed",
-        "appearance",
-        "viewport_size",
-        "is_window_active",
-        "is_window_hovered",
-        "zoom_window",
-        "show_window_menu",
-        "start_window_move",
-        "set_client_inset",
-        "window_decorations",
-        "window_controls",
-        "set_window_title",
-        "set_app_id",
-        "set_background_appearance",
-        "set_window_edited",
-        "display",
-        "show_character_palette",
-        "scale_factor",
-        "rem_size",
-        "set_rem_size",
-        "with_rem_size",
-        "line_height",
-        "prevent_default",
-        "default_prevented",
-        "is_action_available",
-        "mouse_position",
-        "modifiers",
-        "complete_frame",
-        "draw",
-        "present",
-        "draw_roots",
-        "prepaint_tooltip",
-        "prepaint_deferred_draws",
-        "paint_deferred_draws",
-        "prepaint_index",
-        "reuse_prepaint",
-        "paint_index",
-        "reuse_paint",
-        "with_text_style",
-        "set_cursor_style",
-        "set_tooltip",
-        "with_content_mask",
-        "with_element_offset",
-        "with_absolute_element_offset",
-        "with_element_opacity",
-        "transact",
-        "request_autoscroll",
-        "take_autoscroll",
-        "use_asset",
-        "element_offset",
-        "element_opacity",
-        "content_mask",
-        "with_element_namespace",
-        "with_element_state",
-        "with_optional_element_state",
-        "defer_draw",
-        "paint_layer",
-        "paint_shadows",
-        "paint_quad",
-        "paint_path",
-        "paint_underline",
-        "paint_strikethrough",
-        "paint_glyph",
-        "paint_emoji",
-        "paint_svg",
-        "paint_image",
-        "paint_surface",
-        "drop_image",
-        "request_layout",
-        "request_measured_layout",
-        "compute_layout",
-        "layout_bounds",
-        "insert_hitbox",
-        "set_key_context",
-        "set_focus_handle",
-        "set_view_id",
-        "parent_view_id",
-        "handle_input",
-        "on_mouse_event",
-        "on_key_event",
-        "on_modifiers_changed",
-        "on_focus_in",
-        "on_focus_out",
-        "reset_cursor_style",
-        "dispatch_keystroke",
-        "keystroke_text_for",
-        "dispatch_event",
-        "dispatch_mouse_event",
-        "dispatch_key_event",
-        "has_pending_keystrokes",
-        "clear_pending_keystrokes",
-        "pending_input_keystrokes",
-        "replay_pending_input",
-        "dispatch_action_on_node",
-        "observe_global",
-        "activate_window",
-        "minimize_window",
-        "toggle_fullscreen",
-        "invalidate_character_coordinates",
-        "prompt",
-        "context_stack",
-        "available_actions",
-        "bindings_for_action",
-        "all_bindings_for_input",
-        "bindings_for_action_in",
-        "listener_for",
-        "handler_for",
-        "on_window_should_close",
-        "on_action",
-        "gpu_specs",
-        "get_raw_handle",
+        ("window_handle", false),
+        ("refresh", true),
+        ("notify", true),
+        ("remove_window", true),
+        ("focused", true),
+        ("focus", true),
+        ("blur", true),
+        ("disable_focus", true),
+        ("text_system", false),
+        ("text_style", true),
+        ("is_maximized", false),
+        ("request_decorations", false),
+        ("start_window_resize", false),
+        ("window_bounds", false),
+        ("dispatch_action", true),
+        ("defer", true),
+        ("observe", true),
+        ("subscribe", true),
+        ("observe_release", true),
+        ("to_async", true),
+        ("on_next_frame", true),
+        ("request_animation_frame", true),
+        ("spawn", true),
+        ("bounds_changed", true),
+        ("bounds", false),
+        ("is_fullscreen", false),
+        ("appearance_changed", true),
+        ("appearance", false),
+        ("viewport_size", false),
+        ("is_window_active", false),
+        ("is_window_hovered", true),
+        ("zoom_window", false),
+        ("show_window_menu", false),
+        ("start_window_move", false),
+        ("set_client_inset", false),
+        ("window_decorations", false),
+        ("window_controls", false),
+        ("set_window_title", false),
+        ("set_app_id", false),
+        ("set_background_appearance", false),
+        ("set_window_edited", false),
+        ("display", true),
+        ("show_character_palette", false),
+        ("scale_factor", false),
+        ("rem_size", true),
+        ("set_rem_size", true),
+        ("with_rem_size", true),
+        ("line_height", true),
+        ("prevent_default", true),
+        ("default_prevented", false),
+        ("is_action_available", true),
+        ("mouse_position", false),
+        ("modifiers", false),
+        ("complete_frame", false),
+        ("draw", true),
+        ("present", false),
+        ("draw_roots", true),
+        ("prepaint_tooltip", true),
+        ("prepaint_deferred_draws", true),
+        ("paint_deferred_draws", true),
+        ("prepaint_index", false),
+        ("reuse_prepaint", true),
+        ("paint_index", false),
+        ("reuse_paint", true),
+        ("with_text_style", true),
+        ("set_cursor_style", true),
+        ("set_tooltip", true),
+        ("with_content_mask", true),
+        ("with_element_offset", true),
+        ("with_absolute_element_offset", true),
+        ("with_element_opacity", true),
+        ("transact", true),
+        ("request_autoscroll", true),
+        ("take_autoscroll", true),
+        ("use_asset", true),
+        ("element_offset", false),
+        ("element_opacity", false),
+        ("content_mask", false),
+        ("with_element_namespace", true),
+        ("with_element_state", true),
+        ("with_optional_element_state", true),
+        ("defer_draw", true),
+        ("paint_layer", true),
+        ("paint_shadows", true),
+        ("paint_quad", true),
+        ("paint_path", true),
+        ("paint_underline", true),
+        ("paint_strikethrough", true),
+        ("paint_glyph", true),
+        ("paint_emoji", true),
+        ("paint_svg", true),
+        ("paint_image", true),
+        ("paint_surface", true),
+        ("drop_image", true),
+        ("request_layout", true),
+        ("request_measured_layout", true),
+        ("compute_layout", true),
+        ("layout_bounds", true),
+        ("insert_hitbox", true),
+        ("set_key_context", true),
+        ("set_focus_handle", true),
+        ("set_view_id", true),
+        ("parent_view_id", false),
+        ("handle_input", true),
+        ("on_mouse_event", true),
+        ("on_key_event", true),
+        ("on_modifiers_changed", true),
+        ("on_focus_in", true),
+        ("on_focus_out", true),
+        ("reset_cursor_style", true),
+        ("dispatch_keystroke", true),
+        ("keystroke_text_for", true),
+        ("dispatch_event", true),
+        ("dispatch_mouse_event", true),
+        ("dispatch_key_event", true),
+        ("has_pending_keystrokes", false),
+        ("clear_pending_keystrokes", true),
+        ("pending_input_keystrokes", false),
+        ("replay_pending_input", true),
+        ("dispatch_action_on_node", true),
+        ("observe_global", true),
+        ("activate_window", false),
+        ("minimize_window", false),
+        ("toggle_fullscreen", false),
+        ("invalidate_character_coordinates", true),
+        ("prompt", true),
+        ("context_stack", true),
+        ("available_actions", true),
+        ("bindings_for_action", true),
+        ("all_bindings_for_input", true),
+        ("bindings_for_action_in", true),
+        ("listener_for", true),
+        ("handler_for", true),
+        ("on_window_should_close", true),
+        ("on_action", true),
+        ("gpu_specs", false),
+        ("get_raw_handle", false),
     ]
     .iter()
     .cloned()
@@ -482,31 +440,59 @@ fn function_query() -> &'static str {
     "#
 }
 
-fn method_call_query() -> &'static str {
+fn call_query() -> &'static str {
     r#"
         (call_expression
-            function: (field_expression
-                value: (identifier) @object
-                field: (field_identifier) @method
-            )
+            function: [
+                (identifier) @func
+                (field_expression
+                    value: (identifier) @object
+                    field: (field_identifier) @method
+                )
+                (scoped_identifier
+                    path: (_) @path
+                    name: (identifier) @func
+                )
+            ]
+            arguments: (arguments) @args
         )
     "#
 }
 
-fn argument_query() -> &'static str {
-    r#"
-    (call_expression
-      function: [
-        (identifier) @function_name
-        (field_expression
-          field: (field_identifier) @function_name)
-        (scoped_identifier
-          name: (identifier) @function_name)
-      ]
-      arguments: (arguments
-        (identifier) @argument)
-    )
-    "#
+fn add_cx_to_args(
+    source: &str,
+    args: &tree_sitter::QueryCapture,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    let args_start = args.node.start_byte();
+    let args_end = args.node.end_byte();
+    let existing_args = &source[args_start..args_end];
+
+    if existing_args.trim() == "()" {
+        // No existing arguments
+        edits.push((args_start + 1, args_end - 1, "cx".to_string()));
+    } else {
+        // Existing arguments present
+        edits.push((args_end - 1, args_end - 1, ", cx".to_string()));
+    }
+}
+
+fn replace_args_with_window_and_cx(
+    source: &str,
+    args: &tree_sitter::QueryCapture,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    let args_start = args.node.start_byte();
+    let args_end = args.node.end_byte();
+    let existing_args = &source[args_start..args_end];
+
+    if existing_args.trim() == "()" {
+        // No existing arguments
+        edits.push((args_start + 1, args_end - 1, "window, cx".to_string()));
+    } else {
+        // Existing arguments present
+        edits.push((args_start + 1, args_start + 1, "window, cx, ".to_string()));
+    }
 }
 
 fn process_imports(source: &str, parser: &mut Parser, edits: &mut Vec<(usize, usize, String)>) {
