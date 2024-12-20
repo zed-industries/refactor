@@ -614,6 +614,7 @@ fn call_query() -> &'static str {
                     (identifier) @object
                     (field_expression) @object
                     (self) @object
+                    (call_expression)
                 ]
                 field: [
                     (field_identifier) @method
