@@ -2,6 +2,15 @@
 name = "refactor"
 version = "0.1.0"
 edition = "2021"
+default-run = "refactor"
+
+[[bin]]
+name = "refactor"
+path = "src/refactor.rs"
+
+[[bin]]
+name = "print_tree"
+path = "src/print_tree.rs"
 
 [dependencies]
 streaming-iterator = "0.1.9"
