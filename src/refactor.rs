@@ -94,6 +94,8 @@ fn process_functions(
         .expect("Failed to create function query");
     let method_call_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), method_call_query())
         .expect("Failed to create method call query");
+    let argument_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), argument_query())
+        .expect("Failed to create argument query");
     let window_methods = get_window_methods();
 
     let mut function_query_cursor = QueryCursor::new();
@@ -122,6 +124,14 @@ fn process_functions(
     println!("Method call query capture indices:");
     println!("  object: {}", object_index);
     println!("  method: {}", method_index);
+
+    let argument_index = argument_query.capture_index_for_name("argument").unwrap();
+    let function_name_index_arg = argument_query
+        .capture_index_for_name("function_name")
+        .unwrap();
+    println!("Argument query capture indices:");
+    println!("  argument: {}", argument_index);
+    println!("  function_name: {}", function_name_index_arg);
 
     while let Some(match_) = matches.next() {
         if match_.captures.is_empty() {
@@ -209,6 +219,37 @@ fn process_functions(
                             }
                         }
                     }
+
+                    let mut argument_cursor = QueryCursor::new();
+                    let mut arguments =
+                        argument_cursor.matches(&argument_query, body_node, source.as_bytes());
+
+                    while let Some(argument_match) = arguments.next() {
+                        let argument = argument_match
+                            .captures
+                            .iter()
+                            .find(|c| c.index == argument_index);
+                        let function_name = argument_match
+                            .captures
+                            .iter()
+                            .find(|c| c.index == function_name_index_arg);
+
+                        if let (Some(argument), Some(function_name)) = (argument, function_name) {
+                            if &source[argument.node.byte_range()] == param_name {
+                                let function = &source[function_name.node.byte_range()];
+                                println!(
+                                    "Found '{}' passed as argument to function '{}'",
+                                    param_name, function
+                                );
+
+                                edits.push((
+                                    argument.node.start_byte(),
+                                    argument.node.end_byte(),
+                                    "window, cx".to_string(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -236,19 +277,14 @@ fn get_window_methods() -> HashSet<&'static str> {
         "observe",
         "subscribe",
         "observe_release",
-        "activate_window",
-        "minimize_window",
-        "toggle_fullscreen",
-        "invalidate_character_coordinates",
-        "prompt",
-        "observe_global",
-        "dispatch_keystroke",
-        "keystroke_text_for",
-        "dispatch_event",
-        "has_pending_keystrokes",
-        "pending_input_keystrokes",
+        "to_async",
+        "on_next_frame",
+        "request_animation_frame",
+        "spawn",
+        "bounds_changed",
         "bounds",
         "is_fullscreen",
+        "appearance_changed",
         "appearance",
         "viewport_size",
         "is_window_active",
@@ -275,7 +311,90 @@ fn get_window_methods() -> HashSet<&'static str> {
         "is_action_available",
         "mouse_position",
         "modifiers",
+        "complete_frame",
+        "draw",
+        "present",
+        "draw_roots",
+        "prepaint_tooltip",
+        "prepaint_deferred_draws",
+        "paint_deferred_draws",
+        "prepaint_index",
+        "reuse_prepaint",
+        "paint_index",
+        "reuse_paint",
+        "with_text_style",
+        "set_cursor_style",
+        "set_tooltip",
+        "with_content_mask",
+        "with_element_offset",
+        "with_absolute_element_offset",
+        "with_element_opacity",
+        "transact",
+        "request_autoscroll",
+        "take_autoscroll",
+        "use_asset",
+        "element_offset",
+        "element_opacity",
+        "content_mask",
+        "with_element_namespace",
+        "with_element_state",
+        "with_optional_element_state",
+        "defer_draw",
+        "paint_layer",
+        "paint_shadows",
+        "paint_quad",
+        "paint_path",
+        "paint_underline",
+        "paint_strikethrough",
+        "paint_glyph",
+        "paint_emoji",
+        "paint_svg",
+        "paint_image",
+        "paint_surface",
+        "drop_image",
+        "request_layout",
+        "request_measured_layout",
+        "compute_layout",
+        "layout_bounds",
+        "insert_hitbox",
+        "set_key_context",
+        "set_focus_handle",
+        "set_view_id",
+        "parent_view_id",
+        "handle_input",
+        "on_mouse_event",
+        "on_key_event",
+        "on_modifiers_changed",
+        "on_focus_in",
+        "on_focus_out",
+        "reset_cursor_style",
+        "dispatch_keystroke",
+        "keystroke_text_for",
+        "dispatch_event",
+        "dispatch_mouse_event",
+        "dispatch_key_event",
+        "has_pending_keystrokes",
+        "clear_pending_keystrokes",
+        "pending_input_keystrokes",
+        "replay_pending_input",
+        "dispatch_action_on_node",
+        "observe_global",
+        "activate_window",
+        "minimize_window",
+        "toggle_fullscreen",
+        "invalidate_character_coordinates",
+        "prompt",
+        "context_stack",
+        "available_actions",
+        "bindings_for_action",
+        "all_bindings_for_input",
+        "bindings_for_action_in",
+        "listener_for",
+        "handler_for",
+        "on_window_should_close",
+        "on_action",
         "gpu_specs",
+        "get_raw_handle",
     ]
     .iter()
     .cloned()
@@ -283,7 +402,6 @@ fn get_window_methods() -> HashSet<&'static str> {
 }
 
 fn display_dry_run_results(path: &std::path::Path, source: &str, edits: &[(usize, usize, String)]) {
-    return;
     println!("Potential changes for file: {}", path.display());
     for (start, end, replacement) in edits.iter() {
         let start_line = source[..*start].lines().count();
@@ -372,6 +490,22 @@ fn method_call_query() -> &'static str {
                 field: (field_identifier) @method
             )
         )
+    "#
+}
+
+fn argument_query() -> &'static str {
+    r#"
+    (call_expression
+      function: [
+        (identifier) @function_name
+        (field_expression
+          field: (field_identifier) @function_name)
+        (scoped_identifier
+          name: (identifier) @function_name)
+      ]
+      arguments: (arguments
+        (identifier) @argument)
+    )
     "#
 }
 
