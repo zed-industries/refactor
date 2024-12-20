@@ -163,55 +163,179 @@ fn process_functions(
                 ));
 
                 if let Some(body_node) = function_body_node {
-                    let mut call_cursor = QueryCursor::new();
-                    let mut calls = call_cursor.matches(&call_query, body_node, source.as_bytes());
-
-                    while let Some(call) = calls.next() {
-                        let func = call.captures.iter().find(|c| {
-                            c.index == call_query.capture_index_for_name("func").unwrap()
-                        });
-                        let object = call.captures.iter().find(|c| {
-                            c.index == call_query.capture_index_for_name("object").unwrap()
-                        });
-                        let method = call.captures.iter().find(|c| {
-                            c.index == call_query.capture_index_for_name("method").unwrap()
-                        });
-                        let args = call.captures.iter().find(|c| {
-                            c.index == call_query.capture_index_for_name("args").unwrap()
-                        });
-
-                        if let Some(args) = args {
-                            if let (Some(object), Some(method)) = (object, method) {
-                                // Handle object method calls
-                                let object_text = &source[object.node.byte_range()];
-                                let method_name = &source[method.node.byte_range()];
-
-                                if object_text == param_name {
-                                    if let Some(&needs_cx) = window_methods.get(method_name) {
-                                        edits.push((
-                                            object.node.start_byte(),
-                                            object.node.end_byte(),
-                                            "window".to_string(),
-                                        ));
-
-                                        if needs_cx {
-                                            add_cx_to_args(source, args, edits);
-                                        }
-                                    }
-                                }
-                            } else if let Some(func) = func {
-                                // Handle regular function calls
-                                let func_name = &source[func.node.byte_range()];
-                                if func_name == param_name {
-                                    replace_args_with_window_and_cx(source, args, edits);
-                                }
-                            }
-                        }
-                    }
+                    process_function_body(
+                        source,
+                        body_node,
+                        &call_query,
+                        param_name,
+                        &window_methods,
+                        edits,
+                    );
                 }
             }
         }
     }
+}
+
+fn process_function_body(
+    source: &str,
+    body_node: tree_sitter::Node,
+    call_query: &Query,
+    param_name: &str,
+    window_methods: &HashMap<&str, bool>,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    let mut call_cursor = QueryCursor::new();
+    let mut calls = call_cursor.matches(call_query, body_node, source.as_bytes());
+
+    while let Some(call) = calls.next() {
+        let method = call
+            .captures
+            .iter()
+            .find(|c| c.index == call_query.capture_index_for_name("method").unwrap());
+        let object = call
+            .captures
+            .iter()
+            .find(|c| c.index == call_query.capture_index_for_name("object").unwrap());
+        let args = call
+            .captures
+            .iter()
+            .find(|c| c.index == call_query.capture_index_for_name("args").unwrap());
+
+        let line_number = if let Some(args) = args {
+            source[..args.node.start_byte()].lines().count()
+        } else if let Some(method) = method {
+            source[..method.node.start_byte()].lines().count()
+        } else {
+            0 // Or some default value
+        };
+
+        println!("Function call details (line {}):", line_number);
+        println!(
+            "  Method: {:?}",
+            method.map(|m| &source[m.node.byte_range()])
+        );
+        println!(
+            "  Object: {:?}",
+            object.map(|o| &source[o.node.byte_range()])
+        );
+        println!(
+            "  Arguments: {:?}",
+            args.map(|a| &source[a.node.byte_range()])
+        );
+
+        if let Some(args) = args {
+            let mut cursor = args.node.walk();
+            let mut i = 0;
+            for arg in args.node.children(&mut cursor) {
+                if arg.kind() != "," {
+                    let arg_text = &source[arg.byte_range()];
+                    println!("  Argument {}: {:?}", i, arg_text);
+                    if arg_text == param_name {
+                        println!("    Found matching param: {}", param_name);
+                        process_cx_arg(
+                            source,
+                            &tree_sitter::QueryCapture {
+                                node: arg,
+                                index: 0,
+                            },
+                            None,
+                            object,
+                            method,
+                            window_methods,
+                            edits,
+                        );
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+fn process_cx_arg(
+    source: &str,
+    arg: &tree_sitter::QueryCapture,
+    func: Option<&tree_sitter::QueryCapture>,
+    object: Option<&tree_sitter::QueryCapture>,
+    method: Option<&tree_sitter::QueryCapture>,
+    window_methods: &HashMap<&str, bool>,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    if let (Some(object), Some(method)) = (object, method) {
+        // Handle object method calls
+        let object_text = &source[object.node.byte_range()];
+        let method_name = &source[method.node.byte_range()];
+
+        if let Some(&needs_cx) = window_methods.get(method_name) {
+            println!(
+                "Replacing '{}' with 'window' for method '{}'",
+                object_text, method_name
+            );
+            edits.push((
+                object.node.start_byte(),
+                object.node.end_byte(),
+                "window".to_string(),
+            ));
+
+            if needs_cx {
+                println!("Adding 'cx' to arguments for method '{}'", method_name);
+                add_cx_to_arg(source, arg, edits);
+            } else {
+                println!("Not adding 'cx' to arguments for method '{}'", method_name);
+            }
+        } else {
+            println!(
+                "Replacing '{}' with 'window' for non-window method '{}'",
+                object_text, method_name
+            );
+            edits.push((
+                object.node.start_byte(),
+                object.node.end_byte(),
+                "window".to_string(),
+            ));
+            println!(
+                "Adding 'cx' to arguments for non-window method '{}'",
+                method_name
+            );
+            add_cx_to_arg(source, arg, edits);
+        }
+    } else if let Some(func) = func {
+        // Handle regular function calls
+        let func_name = &source[func.node.byte_range()];
+        println!(
+            "Replacing argument '{}' with 'window, cx' for function '{}'",
+            &source[arg.node.byte_range()],
+            func_name
+        );
+        replace_arg_with_window_and_cx(source, arg, edits);
+    } else {
+        // Check if cx is passed as an argument
+        println!(
+            "Replacing argument '{}' with 'window, cx'",
+            &source[arg.node.byte_range()]
+        );
+        replace_arg_with_window_and_cx(source, arg, edits);
+    }
+}
+
+fn add_cx_to_arg(
+    _source: &str,
+    arg: &tree_sitter::QueryCapture,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    let arg_end = arg.node.end_byte();
+    edits.push((arg_end, arg_end, ", cx".to_string()));
+}
+
+fn replace_arg_with_window_and_cx(
+    _source: &str,
+    arg: &tree_sitter::QueryCapture,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    let arg_start = arg.node.start_byte();
+    let arg_end = arg.node.end_byte();
+    edits.push((arg_start, arg_end, "window, cx".to_string()));
 }
 
 fn get_window_methods() -> HashMap<&'static str, bool> {
@@ -374,6 +498,26 @@ fn display_dry_run_results(path: &std::path::Path, source: &str, edits: &[(usize
     }
 }
 
+// The function_query() function returns a Tree-sitter query pattern as a string.
+// This query is used to match function definitions in Rust code that have a
+// parameter of type WindowContext.
+
+// The query matches the following patterns:
+// 1. Function items (regular function definitions)
+// 2. Function signature items (function declarations without bodies)
+// 3. Function types
+// 4. Impl item function definitions
+
+// For each match, it captures:
+// - @function_name: The name of the function
+// - @param_name: The name of the parameter
+// - @param_type: The type of the parameter (which should be "WindowContext")
+// - @target_param: The entire parameter node
+// - @function_body: The body of the function (for function items and impl items)
+
+// This query is used in the process_functions() function to identify functions
+// that need to be refactored, specifically those with a WindowContext parameter
+// that should be changed to separate Window and AppContext parameters.
 fn function_query() -> &'static str {
     r#"
         [
@@ -440,59 +584,46 @@ fn function_query() -> &'static str {
     "#
 }
 
+// The call_query() function returns a Tree-sitter query pattern as a string.
+// This query is used to match function or method calls in Rust code.
+
+// The query matches the following patterns:
+// 1. Simple function calls: identifier(arguments)
+// 2. Method calls on objects: object.method(arguments)
+// 3. Method calls on field expressions: object.field.method(arguments)
+// 4. Method calls on 'self': self.method(arguments)
+
+// For each match, it captures:
+// - @method: The name of the function or method being called
+// - @object: The object on which the method is being called (for method calls)
+// - @field_index: The field index for tuple-like structs (if applicable)
+// - @args: The arguments passed to the function or method
+
+// This query is used in the process_function_body() function to identify function
+// calls within the body of functions that are being refactored. It helps in
+// determining how to update the arguments passed to these calls, especially
+// when dealing with the WindowContext parameter that's being split into
+// separate Window and AppContext parameters.
 fn call_query() -> &'static str {
     r#"
-        (call_expression
-            function: [
-                (identifier) @func
-                (field_expression
-                    value: (identifier) @object
-                    field: (field_identifier) @method
-                )
-                (scoped_identifier
-                    path: (_) @path
-                    name: (identifier) @func
-                )
-            ]
-            arguments: (arguments) @args
-        )
+    (call_expression
+        function: [
+            (identifier) @method
+            (field_expression
+                value: [
+                    (identifier) @object
+                    (field_expression) @object
+                    (self) @object
+                ]
+                field: [
+                    (field_identifier) @method
+                    (integer_literal) @field_index
+                ]
+            )
+        ]
+        arguments: (arguments) @args
+    )
     "#
-}
-
-fn add_cx_to_args(
-    source: &str,
-    args: &tree_sitter::QueryCapture,
-    edits: &mut Vec<(usize, usize, String)>,
-) {
-    let args_start = args.node.start_byte();
-    let args_end = args.node.end_byte();
-    let existing_args = &source[args_start..args_end];
-
-    if existing_args.trim() == "()" {
-        // No existing arguments
-        edits.push((args_start + 1, args_end - 1, "cx".to_string()));
-    } else {
-        // Existing arguments present
-        edits.push((args_end - 1, args_end - 1, ", cx".to_string()));
-    }
-}
-
-fn replace_args_with_window_and_cx(
-    source: &str,
-    args: &tree_sitter::QueryCapture,
-    edits: &mut Vec<(usize, usize, String)>,
-) {
-    let args_start = args.node.start_byte();
-    let args_end = args.node.end_byte();
-    let existing_args = &source[args_start..args_end];
-
-    if existing_args.trim() == "()" {
-        // No existing arguments
-        edits.push((args_start + 1, args_end - 1, "window, cx".to_string()));
-    } else {
-        // Existing arguments present
-        edits.push((args_start + 1, args_start + 1, "window, cx, ".to_string()));
-    }
 }
 
 fn process_imports(source: &str, parser: &mut Parser, edits: &mut Vec<(usize, usize, String)>) {
