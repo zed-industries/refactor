@@ -1,8 +1,13 @@
 use anyhow::{Context as _, Result};
 use clap::Parser as ClapParser;
 use protobuf::Message;
-use scip::types::Index;
-use std::{collections::HashMap, fs::File, io::Read, path::PathBuf};
+use scip::types::{Index, Occurrence};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
@@ -14,13 +19,15 @@ struct Args {
     path: String,
 
     /// Perform a dry run (show potential changes without applying them)
-    #[clap(long, action)]
-    dry_run: bool,
+    #[clap(long, short = 'd', action)]
+    dry: bool,
 }
 
 struct Refactor {
     parser: Parser,
     index: Index,
+    index_folder: PathBuf,
+    callers: HashMap<String, BTreeSet<String>>,
     window_methods: HashMap<&'static str, bool>,
     path: PathBuf,
     edits: HashMap<PathBuf, Vec<Edit>>,
@@ -39,7 +46,33 @@ impl Refactor {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .context("Failed to set language for parser")?;
 
-        let index_path = path.join("index.scip");
+        let (index_folder, index) = Self::load_scip_index(&path)?;
+
+        Ok(Self {
+            parser,
+            index,
+            index_folder,
+            callers: HashMap::new(),
+            window_methods: Self::build_window_methods(),
+            path,
+            edits: HashMap::new(),
+        })
+    }
+
+    fn load_scip_index(path: &PathBuf) -> Result<(PathBuf, Index)> {
+        let mut current_dir = path.clone();
+        let mut index_path = None;
+        while let Some(parent) = current_dir.parent() {
+            let potential_index_path = current_dir.join("index.scip");
+            if potential_index_path.exists() {
+                index_path = Some(potential_index_path);
+                break;
+            }
+            current_dir = parent.to_path_buf();
+        }
+        let index_path =
+            index_path.context("Failed to find index.scip in any ancestor directory")?;
+        let index_folder = index_path.parent().unwrap().to_path_buf();
         let mut file = File::open(&index_path)
             .context(format!("Failed to open index file: {:?}", index_path))?;
         let mut buffer = Vec::new();
@@ -48,20 +81,16 @@ impl Refactor {
 
         let mut index =
             Index::parse_from_bytes(&buffer).context("Failed to parse index from bytes")?;
-        index
-            .documents
-            .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        index.documents.sort_by(|a, b| {
+            std::path::Path::new(&a.relative_path).cmp(std::path::Path::new(&b.relative_path))
+        });
         for doc in &mut index.documents {
             doc.occurrences.sort_by_key(|a| a.range[0]);
         }
 
-        Ok(Self {
-            parser,
-            index,
-            window_methods: Self::build_window_methods(),
-            path,
-            edits: HashMap::new(),
-        })
+        println!("Loaded {} documents", index.documents.len());
+
+        Ok((index_folder, index))
     }
 
     pub fn process(&mut self) -> Result<()> {
@@ -73,6 +102,9 @@ impl Refactor {
             })
         {
             let file_path = entry.path();
+            let relative_path = file_path
+                .strip_prefix(&self.index_folder)
+                .unwrap_or(file_path);
             let mut file = File::open(file_path)?;
             let mut source = String::new();
             file.read_to_string(&mut source)?;
@@ -80,8 +112,85 @@ impl Refactor {
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            self.process_functions(&source, root_node);
-            self.process_imports(&source);
+            self.track_callers(&source, root_node, relative_path)?;
+            // self.process_functions(&source, root_node);
+            // self.process_imports(&source);
+        }
+
+        Ok(())
+    }
+
+    fn track_callers(
+        &mut self,
+        source: &str,
+        root_node: tree_sitter::Node,
+        relative_path: &std::path::Path,
+    ) -> Result<()> {
+        let function_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.function_query())
+            .expect("Failed to create function query");
+        let call_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.call_query())
+            .expect("Failed to create call query");
+
+        let mut function_query_cursor = QueryCursor::new();
+        let mut matches =
+            function_query_cursor.matches(&function_query, root_node, source.as_bytes());
+
+        while let Some(match_) = matches.next() {
+            let function_name_node = match_
+                .captures
+                .iter()
+                .find(|c| {
+                    c.index
+                        == function_query
+                            .capture_index_for_name("function_name")
+                            .unwrap()
+                })
+                .map(|c| c.node);
+
+            let function_body = match_
+                .captures
+                .iter()
+                .find(|c| {
+                    c.index
+                        == function_query
+                            .capture_index_for_name("function_body")
+                            .unwrap()
+                })
+                .map(|c| c.node);
+
+            if let (Some(name_node), Some(body_node)) = (function_name_node, function_body) {
+                let function_occurrence = self.find_occurrence(
+                    relative_path,
+                    name_node.start_position().row,
+                    name_node.start_position().column,
+                    source,
+                )?;
+
+                let parent_symbol = function_occurrence.symbol.clone();
+
+                let mut call_cursor = QueryCursor::new();
+                let mut calls = call_cursor.matches(&call_query, body_node, source.as_bytes());
+
+                while let Some(call) = calls.next() {
+                    if let Some(method) = call
+                        .captures
+                        .iter()
+                        .find(|c| c.index == call_query.capture_index_for_name("method").unwrap())
+                    {
+                        let method_occurrence = self.find_occurrence(
+                            relative_path,
+                            method.node.start_position().row,
+                            method.node.start_position().column,
+                            source,
+                        )?;
+                        let method_symbol = method_occurrence.symbol.clone();
+                        self.callers
+                            .entry(method_symbol)
+                            .or_insert_with(BTreeSet::new)
+                            .insert(parent_symbol.clone());
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -118,10 +227,15 @@ impl Refactor {
             let mut target_param_start = None;
             let mut target_param_end = None;
             let mut function_body_node = None;
+            let mut function_name = "";
+            let mut function_name_node = None;
 
             for capture in match_.captures {
                 match capture.index {
-                    i if i == function_name_index => {}
+                    i if i == function_name_index => {
+                        function_name = &source[capture.node.byte_range()];
+                        function_name_node = Some(capture.node);
+                    }
                     i if i == param_name_index => {
                         param_name = &source[capture.node.byte_range()];
                     }
@@ -291,6 +405,281 @@ impl Refactor {
         }
     }
 
+    fn process_imports(&mut self, source: &str) {
+        let tree = self.parser.parse(source, None).unwrap();
+        let root_node = tree.root_node();
+
+        let import_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.imports_query())
+            .expect("Failed to create import query");
+
+        let mut query_cursor = QueryCursor::new();
+        let mut matches = query_cursor.matches(&import_query, root_node, source.as_bytes());
+
+        let mut window_context_import: Option<(usize, usize)> = None;
+        let mut window_imported = false;
+        let mut app_context_imported = false;
+
+        while let Some(match_) = matches.next() {
+            let mut import_name = "";
+            let mut import_start = 0;
+            let mut import_end = 0;
+
+            for capture in match_.captures {
+                match import_query.capture_names()[capture.index as usize] {
+                    "import_name" => {
+                        import_name = &source[capture.node.byte_range()];
+                        import_start = capture.node.start_byte();
+                        import_end = capture.node.end_byte();
+                    }
+                    _ => {}
+                }
+            }
+
+            match import_name {
+                "WindowContext" => window_context_import = Some((import_start, import_end)),
+                "Window" => window_imported = true,
+                "AppContext" => app_context_imported = true,
+                _ => {}
+            }
+        }
+
+        if let Some((start, end)) = window_context_import {
+            if !window_imported && !app_context_imported {
+                // Replace WindowContext with Window and AppContext
+                self.edits.entry(self.path.clone()).or_default().push(Edit {
+                    start,
+                    end,
+                    replacement: "{Window, AppContext}".to_string(),
+                });
+            } else if !window_imported {
+                // Only add Window
+                self.edits.entry(self.path.clone()).or_default().push(Edit {
+                    start,
+                    end,
+                    replacement: "Window".to_string(),
+                });
+            } else if !app_context_imported {
+                // Only add AppContext
+                self.edits.entry(self.path.clone()).or_default().push(Edit {
+                    start,
+                    end,
+                    replacement: "AppContext".to_string(),
+                });
+            }
+            // If both are already imported, we don't need to do anything
+        }
+    }
+
+    fn find_occurrence(
+        &self,
+        relative_path: &std::path::Path,
+        line: usize,
+        column: usize,
+        source: &str,
+    ) -> Result<&Occurrence> {
+        let document = self
+            .index
+            .documents
+            .binary_search_by(|doc| Path::new(&doc.relative_path).cmp(relative_path))
+            .map_err(|_| anyhow::anyhow!("Document not found: {:?}", relative_path))?;
+        let doc = &self.index.documents[document];
+
+        let occurrence_index = doc
+            .occurrences
+            .binary_search_by(|occ| {
+                let start_line = occ.range[0] as usize;
+                let start_column = occ.range[1] as usize;
+
+                if start_line != line {
+                    start_line.cmp(&line)
+                } else {
+                    start_column.cmp(&column)
+                }
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("Occurrence not found at line {} column {}", line, column)
+            })?;
+
+        Ok(&doc.occurrences[occurrence_index])
+    }
+
+    pub fn display_dry_run_results(&self) {
+        for (path, edits) in &self.edits {
+            let mut file = File::open(path).expect("Failed to open file");
+            let mut source = String::new();
+            file.read_to_string(&mut source)
+                .expect("Failed to read file");
+
+            println!("File: {:?}", path);
+            println!("---");
+
+            for edit in edits {
+                let start_line = source[..edit.start].lines().count();
+                let end_line = source[..edit.end].lines().count();
+                let context_start = source[..edit.start].rfind('\n').map_or(0, |i| i + 1);
+                let context_end = source[edit.end..]
+                    .find('\n')
+                    .map_or(source.len(), |i| edit.end + i);
+
+                println!("Lines {}-{}:", start_line, end_line);
+                println!("- {}", &source[context_start..context_end]);
+                println!(
+                    "+ {}{}{}",
+                    &source[context_start..edit.start],
+                    edit.replacement,
+                    &source[edit.end..context_end]
+                );
+                println!();
+            }
+
+            println!("---\n");
+        }
+    }
+
+    fn display_callers(&self) {
+        println!("Callers:");
+        for (method, callers) in &self.callers {
+            println!("  Method: {}", method);
+            for caller in callers {
+                println!("    Called by: {}", caller);
+            }
+        }
+    }
+
+    pub fn apply_edits(&mut self) -> Result<()> {
+        let mut changed_files = 0;
+        for (path, edits) in self.edits.iter_mut() {
+            let mut file = File::open(path).context("Failed to open file")?;
+            let mut source = String::new();
+            file.read_to_string(&mut source)
+                .context("Failed to read file")?;
+
+            let mut new_source = source.clone();
+            edits.sort_by(|a, b| b.start.cmp(&a.start));
+            for edit in edits.iter() {
+                new_source.replace_range(edit.start..edit.end, &edit.replacement);
+            }
+
+            std::fs::write(path, new_source).context("Failed to write file")?;
+            changed_files += 1;
+        }
+        println!("Changed {} files", changed_files);
+        Ok(())
+    }
+
+    fn function_query(&self) -> &'static str {
+        r#"
+            [
+              (function_item
+                name: (identifier) @function_name
+                parameters: (parameters
+                  (parameter
+                    pattern: (identifier) @param_name
+                    type: (reference_type
+                      (mutable_specifier)?
+                      type: (type_identifier) @param_type
+                    )
+                  ) @target_param
+                )
+                body: (block) @function_body
+              )
+              (#eq? @param_type "WindowContext")
+              (function_signature_item
+                name: (identifier) @function_name
+                parameters: (parameters
+                  (parameter
+                    pattern: (identifier) @param_name
+                    type: (reference_type
+                      (mutable_specifier)?
+                      type: (type_identifier) @param_type
+                    )
+                  ) @target_param
+                )
+              )
+              (#eq? @param_type "WindowContext")
+              (function_type
+                parameters: (parameters
+                  (reference_type
+                    (mutable_specifier)?
+                    type: (generic_type
+                      type: (type_identifier) @param_type
+                      type_arguments: (type_arguments
+                        (lifetime)?
+                      )
+                    )
+                  ) @target_param
+                )
+              )
+              (#eq? @param_type "WindowContext")
+              (impl_item
+                body: (declaration_list
+                  (function_item
+                    name: (identifier) @function_name
+                    parameters: (parameters
+                      (self_parameter)?
+                      (parameter
+                        type: (reference_type
+                          (mutable_specifier)?
+                          type: (type_identifier) @param_type
+                        )
+                      ) @target_param
+                    )
+                    body: (block) @function_body
+                  )
+                )
+              )
+              (#eq? @param_type "WindowContext")
+            ]
+        "#
+    }
+
+    fn call_query(&self) -> &'static str {
+        r#"
+        (call_expression
+            function: [
+                (identifier) @method
+                (scoped_identifier) @object
+                (field_expression
+                    value: [
+                        (identifier) @object
+                        (field_expression) @object
+                        (self) @object
+                        (call_expression)
+                    ]
+                    field: [
+                        (field_identifier) @method
+                        (integer_literal) @field_index
+                    ]
+                )
+            ]
+            arguments: (arguments) @args
+        )
+        "#
+    }
+
+    fn imports_query(&self) -> &'static str {
+        r#"
+        (use_declaration
+          argument: [
+            (scoped_identifier
+              path: (_) @path
+              name: (identifier) @import_name
+            )
+            (scoped_use_list
+              path: (_) @path
+              list: (use_list
+                (identifier) @import_name
+              )
+            )
+            (use_list
+              (identifier) @import_name
+            )
+          ]
+          (#match? @import_name "^(WindowContext|Window|AppContext)$")
+        )
+        "#
+    }
+
     fn build_window_methods() -> HashMap<&'static str, bool> {
         [
             ("window_handle", false),
@@ -435,234 +824,6 @@ impl Refactor {
         .cloned()
         .collect()
     }
-
-    fn process_imports(&mut self, source: &str) {
-        let tree = self.parser.parse(source, None).unwrap();
-        let root_node = tree.root_node();
-
-        let import_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.imports_query())
-            .expect("Failed to create import query");
-
-        let mut query_cursor = QueryCursor::new();
-        let mut matches = query_cursor.matches(&import_query, root_node, source.as_bytes());
-
-        let mut window_context_import: Option<(usize, usize)> = None;
-        let mut window_imported = false;
-        let mut app_context_imported = false;
-
-        while let Some(match_) = matches.next() {
-            let mut import_name = "";
-            let mut import_start = 0;
-            let mut import_end = 0;
-
-            for capture in match_.captures {
-                match import_query.capture_names()[capture.index as usize] {
-                    "import_name" => {
-                        import_name = &source[capture.node.byte_range()];
-                        import_start = capture.node.start_byte();
-                        import_end = capture.node.end_byte();
-                    }
-                    _ => {}
-                }
-            }
-
-            match import_name {
-                "WindowContext" => window_context_import = Some((import_start, import_end)),
-                "Window" => window_imported = true,
-                "AppContext" => app_context_imported = true,
-                _ => {}
-            }
-        }
-
-        if let Some((start, end)) = window_context_import {
-            if !window_imported && !app_context_imported {
-                // Replace WindowContext with Window and AppContext
-                self.edits.entry(self.path.clone()).or_default().push(Edit {
-                    start,
-                    end,
-                    replacement: "{Window, AppContext}".to_string(),
-                });
-            } else if !window_imported {
-                // Only add Window
-                self.edits.entry(self.path.clone()).or_default().push(Edit {
-                    start,
-                    end,
-                    replacement: "Window".to_string(),
-                });
-            } else if !app_context_imported {
-                // Only add AppContext
-                self.edits.entry(self.path.clone()).or_default().push(Edit {
-                    start,
-                    end,
-                    replacement: "AppContext".to_string(),
-                });
-            }
-            // If both are already imported, we don't need to do anything
-        }
-    }
-
-    fn display_dry_run_results(&self) {
-        for (path, edits) in &self.edits {
-            let mut file = File::open(path).expect("Failed to open file");
-            let mut source = String::new();
-            file.read_to_string(&mut source)
-                .expect("Failed to read file");
-
-            println!("File: {:?}", path);
-            println!("---");
-
-            for edit in edits {
-                let start_line = source[..edit.start].lines().count();
-                let end_line = source[..edit.end].lines().count();
-                let context_start = source[..edit.start].rfind('\n').map_or(0, |i| i + 1);
-                let _context_end = source[edit.end..]
-                    .find('\n')
-                    .map_or(source.len(), |i| edit.end + i);
-
-                println!("Lines {}-{}:", start_line, end_line);
-                println!("- {}", &source[context_start..edit.end]);
-                println!(
-                    "+ {}{}",
-                    &source[context_start..edit.start],
-                    edit.replacement
-                );
-                println!();
-            }
-
-            println!("---\n");
-        }
-    }
-
-    fn apply_edits(&mut self) -> Result<()> {
-        for (path, edits) in self.edits.iter_mut() {
-            let mut file = File::open(path).context("Failed to open file")?;
-            let mut source = String::new();
-            file.read_to_string(&mut source)
-                .context("Failed to read file")?;
-
-            let mut new_source = source.clone();
-            edits.sort_by(|a, b| b.start.cmp(&a.start));
-            for edit in edits.iter() {
-                new_source.replace_range(edit.start..edit.end, &edit.replacement);
-            }
-
-            std::fs::write(path, new_source).context("Failed to write file")?;
-        }
-        Ok(())
-    }
-
-    fn function_query(&self) -> &'static str {
-        r#"
-            [
-              (function_item
-                name: (identifier) @function_name
-                parameters: (parameters
-                  (parameter
-                    pattern: (identifier) @param_name
-                    type: (reference_type
-                      (mutable_specifier)?
-                      type: (type_identifier) @param_type
-                    )
-                  ) @target_param
-                )
-                body: (block) @function_body
-              )
-              (#eq? @param_type "WindowContext")
-              (function_signature_item
-                name: (identifier) @function_name
-                parameters: (parameters
-                  (parameter
-                    pattern: (identifier) @param_name
-                    type: (reference_type
-                      (mutable_specifier)?
-                      type: (type_identifier) @param_type
-                    )
-                  ) @target_param
-                )
-              )
-              (#eq? @param_type "WindowContext")
-              (function_type
-                parameters: (parameters
-                  (reference_type
-                    (mutable_specifier)?
-                    type: (generic_type
-                      type: (type_identifier) @param_type
-                      type_arguments: (type_arguments
-                        (lifetime)?
-                      )
-                    )
-                  ) @target_param
-                )
-              )
-              (#eq? @param_type "WindowContext")
-              (impl_item
-                body: (declaration_list
-                  (function_item
-                    name: (identifier) @function_name
-                    parameters: (parameters
-                      (self_parameter)?
-                      (parameter
-                        type: (reference_type
-                          (mutable_specifier)?
-                          type: (type_identifier) @param_type
-                        )
-                      ) @target_param
-                    )
-                    body: (block) @function_body
-                  )
-                )
-              )
-              (#eq? @param_type "WindowContext")
-            ]
-        "#
-    }
-
-    fn call_query(&self) -> &'static str {
-        r#"
-        (call_expression
-            function: [
-                (identifier) @method
-                (scoped_identifier) @object
-                (field_expression
-                    value: [
-                        (identifier) @object
-                        (field_expression) @object
-                        (self) @object
-                        (call_expression)
-                    ]
-                    field: [
-                        (field_identifier) @method
-                        (integer_literal) @field_index
-                    ]
-                )
-            ]
-            arguments: (arguments) @args
-        )
-        "#
-    }
-
-    fn imports_query(&self) -> &'static str {
-        r#"
-        (use_declaration
-          argument: [
-            (scoped_identifier
-              path: (_) @path
-              name: (identifier) @import_name
-            )
-            (scoped_use_list
-              path: (_) @path
-              list: (use_list
-                (identifier) @import_name
-              )
-            )
-            (use_list
-              (identifier) @import_name
-            )
-          ]
-          (#match? @import_name "^(WindowContext|Window|AppContext)$")
-        )
-        "#
-    }
 }
 
 fn main() -> Result<()> {
@@ -675,11 +836,11 @@ fn main() -> Result<()> {
     let mut refactor = refactor?;
     refactor.process()?;
 
-    if args.dry_run {
-        refactor.display_dry_run_results();
+    if args.dry {
+        refactor.display_callers();
+        // refactor.display_dry_run_results();
     } else {
-        // TODO: Implement actual file modifications
-        println!("Refactoring complete. File modifications not implemented yet.");
+        refactor.apply_edits()?;
     }
 
     // TODO: Implement the refactoring logic using the Refactor struct
