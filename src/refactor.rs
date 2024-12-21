@@ -191,7 +191,7 @@ impl Refactor {
             let root_node = tree.root_node();
 
             self.track_callers(&source, root_node, relative_path)?;
-            // self.process_functions(&source, root_node);
+            self.process_functions(&source, root_node, relative_path);
             // self.process_imports(&source);
         }
 
@@ -320,7 +320,12 @@ impl Refactor {
         }
     }
 
-    fn process_functions(&mut self, source: &str, root_node: tree_sitter::Node) {
+    fn process_functions(
+        &mut self,
+        source: &str,
+        root_node: tree_sitter::Node,
+        relative_path: &std::path::Path,
+    ) {
         let function_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.function_query())
             .expect("Failed to create function query");
         let call_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.call_query())
@@ -388,19 +393,25 @@ impl Refactor {
                         "window: &mut Window, cx: &mut AppContext"
                     };
 
-                    self.edits.entry(self.path.clone()).or_default().push(Edit {
-                        start,
-                        end,
-                        replacement: new_param.to_string(),
-                    });
+                    self.edits
+                        .entry(relative_path.to_path_buf())
+                        .or_default()
+                        .push(Edit {
+                            start,
+                            end,
+                            replacement: new_param.to_string(),
+                        });
                 }
             } else {
                 if let (Some(start), Some(end)) = (target_param_start, target_param_end) {
-                    self.edits.entry(self.path.clone()).or_default().push(Edit {
-                        start,
-                        end,
-                        replacement: "window: &mut Window, cx: &mut AppContext".to_string(),
-                    });
+                    self.edits
+                        .entry(relative_path.to_path_buf())
+                        .or_default()
+                        .push(Edit {
+                            start,
+                            end,
+                            replacement: "window: &mut Window, cx: &mut AppContext".to_string(),
+                        });
 
                     if let Some(body_node) = function_body_node {
                         self.process_function_body(source, body_node, &call_query, param_name);
