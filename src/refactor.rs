@@ -239,12 +239,18 @@ impl Refactor {
                 .map(|c| c.node);
 
             if let (Some(name_node), Some(body_node)) = (function_name_node, function_body) {
-                let function_occurrence = self.find_occurrence(
+                let function_occurrence = match self.find_occurrence(
                     relative_path,
                     name_node.start_position().row,
                     name_node.start_position().column,
                     source,
-                )?;
+                ) {
+                    Ok(occurrence) => occurrence,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        continue;
+                    }
+                };
 
                 let parent_symbol = function_occurrence.symbol.clone();
 
@@ -257,17 +263,21 @@ impl Refactor {
                         .iter()
                         .find(|c| c.index == call_query.capture_index_for_name("method").unwrap())
                     {
-                        let method_occurrence = self.find_occurrence(
+                        match self.find_occurrence(
                             relative_path,
                             method.node.start_position().row,
                             method.node.start_position().column,
                             source,
-                        )?;
-                        let method_symbol = method_occurrence.symbol.clone();
-                        self.caller_graph
-                            .entry(method_symbol)
-                            .or_insert_with(BTreeSet::new)
-                            .insert(parent_symbol.clone());
+                        ) {
+                            Ok(method_occurrence) => {
+                                let method_symbol = method_occurrence.symbol.clone();
+                                self.caller_graph
+                                    .entry(method_symbol)
+                                    .or_insert_with(BTreeSet::new)
+                                    .insert(parent_symbol.clone());
+                            }
+                            Err(e) => eprintln!("{}", e),
+                        }
                     }
                 }
             }
