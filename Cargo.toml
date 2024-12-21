@@ -12,9 +12,16 @@ path = "src/refactor.rs"
 name = "print_tree"
 path = "src/print_tree.rs"
 
+[[bin]]
+name = "print_scip"
+path = "src/print_scip.rs"
+
 [dependencies]
+anyhow = "1.0.94"
 clap = { version = "4.5.23", features = ["derive"] }
 lazy_static = "1.5.0"
+protobuf = "3.7.1"
+scip = "0.5.1"
 streaming-iterator = "0.1.9"
 tree-sitter = "0.24.5"
 tree-sitter-rust = "0.23.2"
