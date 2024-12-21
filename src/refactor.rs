@@ -202,52 +202,46 @@ fn process_function_body(
             .iter()
             .find(|c| c.index == call_query.capture_index_for_name("args").unwrap());
 
-        let line_number = if let Some(args) = args {
-            source[..args.node.start_byte()].lines().count()
-        } else if let Some(method) = method {
-            source[..method.node.start_byte()].lines().count()
-        } else {
-            0 // Or some default value
-        };
-
-        println!("Function call details (line {}):", line_number);
-        println!(
-            "  Method: {:?}",
-            method.map(|m| &source[m.node.byte_range()])
-        );
-        println!(
-            "  Object: {:?}",
-            object.map(|o| &source[o.node.byte_range()])
-        );
-        println!(
-            "  Arguments: {:?}",
-            args.map(|a| &source[a.node.byte_range()])
-        );
-
         if let Some(args) = args {
-            let mut cursor = args.node.walk();
-            let mut i = 0;
-            for arg in args.node.children(&mut cursor) {
-                if arg.kind() != "," {
-                    let arg_text = &source[arg.byte_range()];
-                    println!("  Argument {}: {:?}", i, arg_text);
-                    if arg_text == param_name {
-                        println!("    Found matching param: {}", param_name);
-                        process_cx_arg(
-                            source,
-                            &tree_sitter::QueryCapture {
-                                node: arg,
-                                index: 0,
-                            },
-                            None,
-                            object,
-                            method,
-                            window_methods,
-                            edits,
-                        );
-                    }
-                    i += 1;
-                }
+            process_call(
+                source,
+                args,
+                object,
+                method,
+                param_name,
+                window_methods,
+                edits,
+            );
+        }
+    }
+}
+
+fn process_call(
+    source: &str,
+    args: &tree_sitter::QueryCapture,
+    object: Option<&tree_sitter::QueryCapture>,
+    method: Option<&tree_sitter::QueryCapture>,
+    param_name: &str,
+    window_methods: &HashMap<&str, bool>,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    let mut cursor = args.node.walk();
+    for arg in args.node.children(&mut cursor) {
+        if arg.kind() != "," {
+            let arg_text = &source[arg.byte_range()];
+            if arg_text == param_name {
+                process_cx_arg(
+                    source,
+                    &tree_sitter::QueryCapture {
+                        node: arg,
+                        index: 0,
+                    },
+                    object,
+                    method,
+                    window_methods,
+                    edits,
+                    param_name,
+                );
             }
         }
     }
@@ -256,86 +250,47 @@ fn process_function_body(
 fn process_cx_arg(
     source: &str,
     arg: &tree_sitter::QueryCapture,
-    func: Option<&tree_sitter::QueryCapture>,
     object: Option<&tree_sitter::QueryCapture>,
     method: Option<&tree_sitter::QueryCapture>,
     window_methods: &HashMap<&str, bool>,
     edits: &mut Vec<(usize, usize, String)>,
+    param_name: &str,
 ) {
     if let (Some(object), Some(method)) = (object, method) {
-        // Handle object method calls
         let object_text = &source[object.node.byte_range()];
         let method_name = &source[method.node.byte_range()];
 
-        if let Some(&needs_cx) = window_methods.get(method_name) {
-            println!(
-                "Replacing '{}' with 'window' for method '{}'",
-                object_text, method_name
-            );
-            edits.push((
-                object.node.start_byte(),
-                object.node.end_byte(),
-                "window".to_string(),
-            ));
+        // If this a method call on the context itself, decide whether to call it on window or cx.
+        if object_text == param_name {
+            if let Some(&needs_cx) = window_methods.get(method_name) {
+                edits.push((
+                    object.node.start_byte(),
+                    object.node.end_byte(),
+                    "window".to_string(),
+                ));
 
-            if needs_cx {
-                println!("Adding 'cx' to arguments for method '{}'", method_name);
-                add_cx_to_arg(source, arg, edits);
+                if needs_cx {
+                    let arg_end = arg.node.end_byte();
+                    edits.push((arg_end, arg_end, ", cx".to_string()));
+                }
             } else {
-                println!("Not adding 'cx' to arguments for method '{}'", method_name);
+                let arg_start = arg.node.start_byte();
+                edits.push((arg_start, arg_start, "window, ".to_string()));
             }
         } else {
-            println!(
-                "Replacing '{}' with 'window' for non-window method '{}'",
-                object_text, method_name
-            );
-            edits.push((
-                object.node.start_byte(),
-                object.node.end_byte(),
-                "window".to_string(),
-            ));
-            println!(
-                "Adding 'cx' to arguments for non-window method '{}'",
-                method_name
-            );
-            add_cx_to_arg(source, arg, edits);
+            // For any other call, pass a window and cx through instead of a cx.
+            // TODO! Check the definition of the method being called to decide if we need to pass window.
+            let arg_start = arg.node.start_byte();
+            let arg_end = arg.node.end_byte();
+            edits.push((arg_start, arg_end, "window, cx".to_string()));
         }
-    } else if let Some(func) = func {
-        // Handle regular function calls
-        let func_name = &source[func.node.byte_range()];
-        println!(
-            "Replacing argument '{}' with 'window, cx' for function '{}'",
-            &source[arg.node.byte_range()],
-            func_name
-        );
-        replace_arg_with_window_and_cx(source, arg, edits);
     } else {
-        // Check if cx is passed as an argument
-        println!(
-            "Replacing argument '{}' with 'window, cx'",
-            &source[arg.node.byte_range()]
-        );
-        replace_arg_with_window_and_cx(source, arg, edits);
+        // For any other call, pass a window and cx through instead of a cx.
+        // TODO! Check the definition of the method being called to decide if we need to pass window.
+        let arg_start = arg.node.start_byte();
+        let arg_end = arg.node.end_byte();
+        edits.push((arg_start, arg_end, "window, cx".to_string()));
     }
-}
-
-fn add_cx_to_arg(
-    _source: &str,
-    arg: &tree_sitter::QueryCapture,
-    edits: &mut Vec<(usize, usize, String)>,
-) {
-    let arg_end = arg.node.end_byte();
-    edits.push((arg_end, arg_end, ", cx".to_string()));
-}
-
-fn replace_arg_with_window_and_cx(
-    _source: &str,
-    arg: &tree_sitter::QueryCapture,
-    edits: &mut Vec<(usize, usize, String)>,
-) {
-    let arg_start = arg.node.start_byte();
-    let arg_end = arg.node.end_byte();
-    edits.push((arg_start, arg_end, "window, cx".to_string()));
 }
 
 fn get_window_methods() -> HashMap<&'static str, bool> {
@@ -498,6 +453,59 @@ fn display_dry_run_results(path: &std::path::Path, source: &str, edits: &[(usize
     }
 }
 
+fn process_imports(source: &str, parser: &mut Parser, edits: &mut Vec<(usize, usize, String)>) {
+    let tree = parser.parse(source, None).unwrap();
+    let root_node = tree.root_node();
+
+    let import_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), imports_query())
+        .expect("Failed to create import query");
+
+    let mut query_cursor = QueryCursor::new();
+    let mut matches = query_cursor.matches(&import_query, root_node, source.as_bytes());
+
+    let mut window_context_import: Option<(usize, usize)> = None;
+    let mut window_imported = false;
+    let mut app_context_imported = false;
+
+    while let Some(match_) = matches.next() {
+        let mut import_name = "";
+        let mut import_start = 0;
+        let mut import_end = 0;
+
+        for capture in match_.captures {
+            match import_query.capture_names()[capture.index as usize] {
+                "import_name" => {
+                    import_name = &source[capture.node.byte_range()];
+                    import_start = capture.node.start_byte();
+                    import_end = capture.node.end_byte();
+                }
+                _ => {}
+            }
+        }
+
+        match import_name {
+            "WindowContext" => window_context_import = Some((import_start, import_end)),
+            "Window" => window_imported = true,
+            "AppContext" => app_context_imported = true,
+            _ => {}
+        }
+    }
+
+    if let Some((start, end)) = window_context_import {
+        if !window_imported && !app_context_imported {
+            // Replace WindowContext with Window and AppContext
+            edits.push((start, end, "{Window, AppContext}".to_string()));
+        } else if !window_imported {
+            // Only add Window
+            edits.push((start, end, "Window".to_string()));
+        } else if !app_context_imported {
+            // Only add AppContext
+            edits.push((start, end, "AppContext".to_string()));
+        }
+        // If both are already imported, we don't need to do anything
+    }
+}
+
 // The function_query() function returns a Tree-sitter query pattern as a string.
 // This query is used to match function definitions in Rust code that have a
 // parameter of type WindowContext.
@@ -609,6 +617,7 @@ fn call_query() -> &'static str {
     (call_expression
         function: [
             (identifier) @method
+            (scoped_identifier) @object
             (field_expression
                 value: [
                     (identifier) @object
@@ -627,77 +636,31 @@ fn call_query() -> &'static str {
     "#
 }
 
-fn process_imports(source: &str, parser: &mut Parser, edits: &mut Vec<(usize, usize, String)>) {
-    let tree = parser.parse(source, None).unwrap();
-    let root_node = tree.root_node();
-
-    let import_query = Query::new(
-        &tree_sitter_rust::LANGUAGE.into(),
-        r#"
-        (use_declaration
-          argument: [
-            (scoped_identifier
-              path: (_) @path
-              name: (identifier) @import_name
-            )
-            (scoped_use_list
-              path: (_) @path
-              list: (use_list
-                (identifier) @import_name
-              )
-            )
-            (use_list
-              (identifier) @import_name
-            )
-          ]
-          (#match? @import_name "^(WindowContext|Window|AppContext)$")
+/// Returns a Tree-sitter query pattern for matching import declarations.
+/// Used in process_imports() to find and modify imports of WindowContext, Window, and AppContext.
+/// Matches direct imports, imports from use lists, and nested use lists.
+/// Captures:
+/// - @path: The import path (if applicable)
+/// - @import_name: The name of the imported item
+fn imports_query() -> &'static str {
+    r#"
+    (use_declaration
+      argument: [
+        (scoped_identifier
+          path: (_) @path
+          name: (identifier) @import_name
         )
-        "#,
+        (scoped_use_list
+          path: (_) @path
+          list: (use_list
+            (identifier) @import_name
+          )
+        )
+        (use_list
+          (identifier) @import_name
+        )
+      ]
+      (#match? @import_name "^(WindowContext|Window|AppContext)$")
     )
-    .expect("Failed to create import query");
-
-    let mut query_cursor = QueryCursor::new();
-    let mut matches = query_cursor.matches(&import_query, root_node, source.as_bytes());
-
-    let mut window_context_import: Option<(usize, usize)> = None;
-    let mut window_imported = false;
-    let mut app_context_imported = false;
-
-    while let Some(match_) = matches.next() {
-        let mut import_name = "";
-        let mut import_start = 0;
-        let mut import_end = 0;
-
-        for capture in match_.captures {
-            match import_query.capture_names()[capture.index as usize] {
-                "import_name" => {
-                    import_name = &source[capture.node.byte_range()];
-                    import_start = capture.node.start_byte();
-                    import_end = capture.node.end_byte();
-                }
-                _ => {}
-            }
-        }
-
-        match import_name {
-            "WindowContext" => window_context_import = Some((import_start, import_end)),
-            "Window" => window_imported = true,
-            "AppContext" => app_context_imported = true,
-            _ => {}
-        }
-    }
-
-    if let Some((start, end)) = window_context_import {
-        if !window_imported && !app_context_imported {
-            // Replace WindowContext with Window and AppContext
-            edits.push((start, end, "{Window, AppContext}".to_string()));
-        } else if !window_imported {
-            // Only add Window
-            edits.push((start, end, "Window".to_string()));
-        } else if !app_context_imported {
-            // Only add AppContext
-            edits.push((start, end, "AppContext".to_string()));
-        }
-        // If both are already imported, we don't need to do anything
-    }
+    "#
 }
