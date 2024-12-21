@@ -6,7 +6,7 @@ use scip::types::{
     SyntaxKind, TextEncoding,
 };
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -31,7 +31,8 @@ struct Refactor {
     parser: Parser,
     index: Index,
     index_folder: PathBuf,
-    callers: HashMap<Arc<str>, BTreeSet<Arc<str>>>,
+    caller_graph: HashMap<Arc<str>, BTreeSet<Arc<str>>>,
+    transitive_window_context_callers: HashSet<Arc<str>>,
     window_methods: HashMap<&'static str, bool>,
     path: PathBuf,
     edits: HashMap<PathBuf, Vec<Edit>>,
@@ -128,7 +129,8 @@ impl Refactor {
             parser,
             index,
             index_folder,
-            callers: HashMap::new(),
+            caller_graph: HashMap::new(),
+            transitive_window_context_callers: HashSet::new(),
             window_methods: Self::build_window_methods(),
             path,
             edits: HashMap::new(),
@@ -192,6 +194,8 @@ impl Refactor {
             // self.process_functions(&source, root_node);
             // self.process_imports(&source);
         }
+
+        self.trace_window_context_callers();
 
         Ok(())
     }
@@ -260,7 +264,7 @@ impl Refactor {
                             source,
                         )?;
                         let method_symbol = method_occurrence.symbol.clone();
-                        self.callers
+                        self.caller_graph
                             .entry(method_symbol)
                             .or_insert_with(BTreeSet::new)
                             .insert(parent_symbol.clone());
@@ -270,6 +274,40 @@ impl Refactor {
         }
 
         Ok(())
+    }
+
+    fn trace_window_context_callers(&mut self) {
+        let mut to_process = Vec::new();
+        for (callee, callers) in &self.caller_graph {
+            if callee.contains("WindowContext#") {
+                for caller in callers {
+                    if self
+                        .transitive_window_context_callers
+                        .insert(caller.clone())
+                    {
+                        to_process.push(caller.clone());
+                    }
+                }
+            }
+        }
+
+        while let Some(caller) = to_process.pop() {
+            if let Some(callers) = self.caller_graph.get(&caller) {
+                for caller in callers {
+                    if self
+                        .transitive_window_context_callers
+                        .insert(caller.clone())
+                    {
+                        to_process.push(caller.clone());
+                    }
+                }
+            }
+        }
+
+        println!("!!!!!!!!!!!!!  Window context callers:");
+        for caller in &self.transitive_window_context_callers {
+            println!("  {}", caller);
+        }
     }
 
     fn process_functions(&mut self, source: &str, root_node: tree_sitter::Node) {
@@ -614,7 +652,7 @@ impl Refactor {
 
     fn display_callers(&self) {
         println!("Callers:");
-        for (method, callers) in &self.callers {
+        for (method, callers) in &self.caller_graph {
             println!("  Method: {}", method);
             for caller in callers {
                 println!("    Called by: {}", caller);
