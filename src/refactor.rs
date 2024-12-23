@@ -34,7 +34,6 @@ struct Refactor {
     caller_graph: HashMap<Arc<str>, BTreeSet<Arc<str>>>,
     transitive_window_context_callers: HashSet<Arc<str>>,
     window_methods: HashMap<&'static str, bool>,
-    path: PathBuf,
     edits: HashMap<PathBuf, Vec<Edit>>,
 }
 
@@ -117,7 +116,7 @@ struct Edit {
 }
 
 impl Refactor {
-    pub fn new(path: PathBuf) -> Result<Self> {
+    pub fn new(path: &PathBuf) -> Result<Self> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -132,7 +131,6 @@ impl Refactor {
             caller_graph: HashMap::new(),
             transitive_window_context_callers: HashSet::new(),
             window_methods: Self::build_window_methods(),
-            path,
             edits: HashMap::new(),
         })
     }
@@ -171,8 +169,8 @@ impl Refactor {
         Ok((index_folder, index.into()))
     }
 
-    pub fn process(&mut self) -> Result<()> {
-        for entry in walkdir::WalkDir::new(&self.path)
+    pub fn process(&mut self, path: &PathBuf) -> Result<()> {
+        for entry in walkdir::WalkDir::new(path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -190,9 +188,9 @@ impl Refactor {
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            self.track_callers(&source, root_node, relative_path)?;
-            self.process_functions(&source, root_node, relative_path);
-            // self.process_imports(&source);
+            self.track_callers(relative_path, &source, root_node)?;
+            self.process_functions(relative_path, &source, root_node);
+            // self.process_imports(relative_path, &source);
         }
 
         self.trace_window_context_callers();
@@ -202,9 +200,9 @@ impl Refactor {
 
     fn track_callers(
         &mut self,
+        relative_path: &std::path::Path,
         source: &str,
         root_node: tree_sitter::Node,
-        relative_path: &std::path::Path,
     ) -> Result<()> {
         let function_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.function_query())
             .expect("Failed to create function query");
@@ -240,10 +238,9 @@ impl Refactor {
 
             if let (Some(name_node), Some(body_node)) = (function_name_node, function_body) {
                 let function_occurrence = match self.find_occurrence(
-                    relative_path,
                     name_node.start_position().row,
                     name_node.start_position().column,
-                    source,
+                    relative_path,
                 ) {
                     Ok(occurrence) => occurrence,
                     Err(e) => {
@@ -264,10 +261,9 @@ impl Refactor {
                         .find(|c| c.index == call_query.capture_index_for_name("method").unwrap())
                     {
                         match self.find_occurrence(
-                            relative_path,
                             method.node.start_position().row,
                             method.node.start_position().column,
-                            source,
+                            relative_path,
                         ) {
                             Ok(method_occurrence) => {
                                 let method_symbol = method_occurrence.symbol.clone();
@@ -322,9 +318,9 @@ impl Refactor {
 
     fn process_functions(
         &mut self,
+        relative_path: &std::path::Path,
         source: &str,
         root_node: tree_sitter::Node,
-        relative_path: &std::path::Path,
     ) {
         let function_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.function_query())
             .expect("Failed to create function query");
@@ -414,7 +410,13 @@ impl Refactor {
                         });
 
                     if let Some(body_node) = function_body_node {
-                        self.process_function_body(source, body_node, &call_query, param_name);
+                        self.process_function_body(
+                            relative_path,
+                            source,
+                            body_node,
+                            &call_query,
+                            param_name,
+                        );
                     }
                 }
             }
@@ -423,6 +425,7 @@ impl Refactor {
 
     fn process_function_body(
         &mut self,
+        relative_path: &std::path::Path,
         source: &str,
         body_node: tree_sitter::Node,
         call_query: &Query,
@@ -446,13 +449,14 @@ impl Refactor {
                 .find(|c| c.index == call_query.capture_index_for_name("args").unwrap());
 
             if let Some(args) = args {
-                self.process_call(source, args, object, method, param_name);
+                self.process_call(relative_path, source, args, object, method, param_name);
             }
         }
     }
 
     fn process_call(
         &mut self,
+        relative_path: &std::path::Path,
         source: &str,
         args: &tree_sitter::QueryCapture,
         object: Option<&tree_sitter::QueryCapture>,
@@ -465,6 +469,7 @@ impl Refactor {
                 let arg_text = &source[arg.byte_range()];
                 if arg_text == param_name {
                     self.process_cx_arg(
+                        relative_path,
                         source,
                         &tree_sitter::QueryCapture {
                             node: arg,
@@ -481,6 +486,7 @@ impl Refactor {
 
     fn process_cx_arg(
         &mut self,
+        relative_path: &std::path::Path,
         source: &str,
         arg: &tree_sitter::QueryCapture,
         object: Option<&tree_sitter::QueryCapture>,
@@ -494,53 +500,68 @@ impl Refactor {
             // If this a method call on the context itself, decide whether to call it on window or cx.
             if object_text == param_name {
                 if let Some(&needs_cx) = self.window_methods.get(method_name) {
-                    self.edits.entry(self.path.clone()).or_default().push(Edit {
-                        start: object.node.start_byte(),
-                        end: object.node.end_byte(),
-                        replacement: "window".to_string(),
-                    });
+                    self.edits
+                        .entry(relative_path.to_path_buf())
+                        .or_default()
+                        .push(Edit {
+                            start: object.node.start_byte(),
+                            end: object.node.end_byte(),
+                            replacement: "window".to_string(),
+                        });
 
                     if needs_cx {
                         let arg_end = arg.node.end_byte();
-                        self.edits.entry(self.path.clone()).or_default().push(Edit {
-                            start: arg_end,
-                            end: arg_end,
-                            replacement: ", cx".to_string(),
-                        });
+                        self.edits
+                            .entry(relative_path.to_path_buf())
+                            .or_default()
+                            .push(Edit {
+                                start: arg_end,
+                                end: arg_end,
+                                replacement: ", cx".to_string(),
+                            });
                     }
                 } else {
                     let arg_start = arg.node.start_byte();
-                    self.edits.entry(self.path.clone()).or_default().push(Edit {
-                        start: arg_start,
-                        end: arg_start,
-                        replacement: "window, ".to_string(),
-                    });
+                    self.edits
+                        .entry(relative_path.to_path_buf())
+                        .or_default()
+                        .push(Edit {
+                            start: arg_start,
+                            end: arg_start,
+                            replacement: "window, ".to_string(),
+                        });
                 }
             } else {
                 // For any other call, pass a window and cx through instead of a cx.
                 // TODO! Check the definition of the method being called to decide if we need to pass window.
                 let arg_start = arg.node.start_byte();
                 let arg_end = arg.node.end_byte();
-                self.edits.entry(self.path.clone()).or_default().push(Edit {
-                    start: arg_start,
-                    end: arg_end,
-                    replacement: "window, cx".to_string(),
-                });
+                self.edits
+                    .entry(relative_path.to_path_buf())
+                    .or_default()
+                    .push(Edit {
+                        start: arg_start,
+                        end: arg_end,
+                        replacement: "window, cx".to_string(),
+                    });
             }
         } else {
             // For any other call, pass a window and cx through instead of a cx.
             // TODO! Check the definition of the method being called to decide if we need to pass window.
             let arg_start = arg.node.start_byte();
             let arg_end = arg.node.end_byte();
-            self.edits.entry(self.path.clone()).or_default().push(Edit {
-                start: arg_start,
-                end: arg_end,
-                replacement: "window, cx".to_string(),
-            });
+            self.edits
+                .entry(relative_path.to_path_buf())
+                .or_default()
+                .push(Edit {
+                    start: arg_start,
+                    end: arg_end,
+                    replacement: "window, cx".to_string(),
+                });
         }
     }
 
-    fn process_imports(&mut self, source: &str) {
+    fn process_imports(&mut self, relative_path: &std::path::Path, source: &str) {
         let tree = self.parser.parse(source, None).unwrap();
         let root_node = tree.root_node();
 
@@ -581,25 +602,34 @@ impl Refactor {
         if let Some((start, end)) = window_context_import {
             if !window_imported && !app_context_imported {
                 // Replace WindowContext with Window and AppContext
-                self.edits.entry(self.path.clone()).or_default().push(Edit {
-                    start,
-                    end,
-                    replacement: "{Window, AppContext}".to_string(),
-                });
+                self.edits
+                    .entry(relative_path.to_path_buf())
+                    .or_default()
+                    .push(Edit {
+                        start,
+                        end,
+                        replacement: "{Window, AppContext}".to_string(),
+                    });
             } else if !window_imported {
                 // Only add Window
-                self.edits.entry(self.path.clone()).or_default().push(Edit {
-                    start,
-                    end,
-                    replacement: "Window".to_string(),
-                });
+                self.edits
+                    .entry(relative_path.to_path_buf())
+                    .or_default()
+                    .push(Edit {
+                        start,
+                        end,
+                        replacement: "Window".to_string(),
+                    });
             } else if !app_context_imported {
                 // Only add AppContext
-                self.edits.entry(self.path.clone()).or_default().push(Edit {
-                    start,
-                    end,
-                    replacement: "AppContext".to_string(),
-                });
+                self.edits
+                    .entry(relative_path.to_path_buf())
+                    .or_default()
+                    .push(Edit {
+                        start,
+                        end,
+                        replacement: "AppContext".to_string(),
+                    });
             }
             // If both are already imported, we don't need to do anything
         }
@@ -607,10 +637,9 @@ impl Refactor {
 
     fn find_occurrence(
         &self,
-        relative_path: &std::path::Path,
         line: usize,
         column: usize,
-        source: &str,
+        relative_path: &std::path::Path,
     ) -> Result<&Occurrence> {
         let document = self
             .index
@@ -640,10 +669,14 @@ impl Refactor {
 
     pub fn display_dry_run_results(&self) {
         for (path, edits) in &self.edits {
-            let mut file = File::open(path).expect("Failed to open file");
+            let path = &self.index_folder.join(path);
+            let mut file = File::open(path)
+                .with_context(|| format!("Failed to open file {:?}", path))
+                .unwrap();
             let mut source = String::new();
             file.read_to_string(&mut source)
-                .expect("Failed to read file");
+                .with_context(|| format!("Failed to read file {:?}", path))
+                .unwrap();
 
             println!("File: {:?}", path);
             println!("---");
@@ -684,10 +717,12 @@ impl Refactor {
     pub fn apply_edits(&mut self) -> Result<()> {
         let mut changed_files = 0;
         for (path, edits) in self.edits.iter_mut() {
-            let mut file = File::open(path).context("Failed to open file")?;
+            let path = &self.index_folder.join(path);
+            let mut file =
+                File::open(path).with_context(|| format!("Failed to open file {:?}", path))?;
             let mut source = String::new();
             file.read_to_string(&mut source)
-                .context("Failed to read file")?;
+                .with_context(|| format!("Failed to read file {:?}", path))?;
 
             let mut new_source = source.clone();
             edits.sort_by(|a, b| b.start.cmp(&a.start));
@@ -695,7 +730,8 @@ impl Refactor {
                 new_source.replace_range(edit.start..edit.end, &edit.replacement);
             }
 
-            std::fs::write(path, new_source).context("Failed to write file")?;
+            std::fs::write(path, new_source)
+                .with_context(|| format!("Failed to write file {:?}", path))?;
             changed_files += 1;
         }
         println!("Changed {} files", changed_files);
@@ -1098,9 +1134,9 @@ fn main() -> Result<()> {
     let path = std::fs::canonicalize(&args.path)?;
     let _relative_path = path.strip_prefix(std::env::current_dir()?).unwrap_or(&path);
 
-    let refactor = Refactor::new(path);
+    let refactor = Refactor::new(&path);
     let mut refactor = refactor?;
-    refactor.process()?;
+    refactor.process(&path)?;
 
     if args.dry {
         refactor.display_callers();
