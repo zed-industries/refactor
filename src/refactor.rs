@@ -661,7 +661,12 @@ impl Refactor {
                 }
             })
             .map_err(|_| {
-                anyhow::anyhow!("Occurrence not found at line {} column {}", line, column)
+                anyhow::anyhow!(
+                    "Occurrence not found at {:?}:{}:{}",
+                    relative_path,
+                    line,
+                    column
+                )
             })?;
 
         Ok(&doc.occurrences[occurrence_index])
