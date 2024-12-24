@@ -31,8 +31,8 @@ struct Refactor {
     parser: Parser,
     index: Index,
     index_folder: PathBuf,
-    caller_graph: HashMap<Arc<str>, BTreeSet<Arc<str>>>,
-    transitive_window_context_callers: HashSet<Arc<str>>,
+    caller_graph: HashMap<Symbol, BTreeSet<Symbol>>,
+    transitive_window_context_callers: HashSet<Symbol>,
     window_methods: HashMap<&'static str, bool>,
     edits: HashMap<PathBuf, Vec<Edit>>,
 }
@@ -57,13 +57,16 @@ pub struct Document {
 #[derive(Debug, Clone)]
 pub struct Occurrence {
     pub range: Vec<i32>,
-    pub symbol: Arc<str>,
+    pub symbol: Symbol,
     pub symbol_roles: i32,
     pub override_documentation: Vec<Arc<str>>,
     pub syntax_kind: SyntaxKind,
     pub diagnostics: Vec<Diagnostic>,
     pub enclosing_range: Vec<i32>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Symbol(Arc<str>);
 
 #[derive(Debug, Clone)]
 pub struct SymbolInformation {
@@ -93,7 +96,7 @@ pub struct ToolInfo {
 
 #[derive(Debug, Clone)]
 pub struct Relationship {
-    pub symbol: Arc<str>,
+    pub symbol: Symbol,
     pub is_reference: bool,
     pub is_implementation: bool,
     pub is_type_definition: bool,
@@ -285,7 +288,7 @@ impl Refactor {
     fn trace_window_context_callers(&mut self) {
         let mut to_process = Vec::new();
         for (callee, callers) in &self.caller_graph {
-            if callee.contains("WindowContext#") {
+            if callee.0.contains("WindowContext#") {
                 for caller in callers {
                     if self
                         .transitive_window_context_callers
@@ -312,7 +315,7 @@ impl Refactor {
 
         println!("!!!!!!!!!!!!!  Window context callers:");
         for caller in &self.transitive_window_context_callers {
-            println!("  {}", caller);
+            println!("  {:?}", caller);
         }
     }
 
@@ -712,9 +715,9 @@ impl Refactor {
     fn display_callers(&self) {
         println!("Callers:");
         for (method, callers) in &self.caller_graph {
-            println!("  Method: {}", method);
+            println!("  Method: {:?}", method);
             for caller in callers {
-                println!("    Called by: {}", caller);
+                println!("    Called by: {:?}", caller);
             }
         }
     }
@@ -1062,7 +1065,7 @@ impl From<scip::types::Occurrence> for Occurrence {
     fn from(occurrence: scip::types::Occurrence) -> Self {
         Occurrence {
             range: occurrence.range,
-            symbol: occurrence.symbol.into(),
+            symbol: Symbol(occurrence.symbol.into()),
             symbol_roles: occurrence.symbol_roles,
             override_documentation: occurrence
                 .override_documentation
@@ -1108,7 +1111,7 @@ impl From<scip::types::SymbolInformation> for SymbolInformation {
 impl From<scip::types::Relationship> for Relationship {
     fn from(relationship: scip::types::Relationship) -> Self {
         Relationship {
-            symbol: relationship.symbol.into(),
+            symbol: Symbol(relationship.symbol.into()),
             is_reference: relationship.is_reference,
             is_implementation: relationship.is_implementation,
             is_type_definition: relationship.is_type_definition,
