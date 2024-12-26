@@ -1,6 +1,8 @@
 use anyhow::{Context as _, Result};
 use clap::Parser as ClapParser;
-use refactor::{calls_query::*, functions_query::*, imports_query::*, scip_index::*};
+use refactor::{
+    calls_query::*, functions_query::*, imports_query::*, scip_index::*, WINDOW_METHODS,
+};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::File,
@@ -28,7 +30,6 @@ struct Refactor {
     index_folder: PathBuf,
     caller_graph: HashMap<Symbol, BTreeSet<Symbol>>,
     transitive_window_context_callers: HashSet<Symbol>,
-    window_methods: HashMap<&'static str, bool>,
     edits: HashMap<RelativePath, Vec<Edit>>,
 }
 
@@ -54,7 +55,6 @@ impl Refactor {
             index_folder,
             caller_graph: HashMap::new(),
             transitive_window_context_callers: HashSet::new(),
-            window_methods: Self::build_window_methods(),
             edits: HashMap::new(),
         })
     }
@@ -243,7 +243,7 @@ impl Refactor {
 
             // If this a method call on the context itself, decide whether to call it on window or cx.
             if object_text == param_name {
-                if let Some(&needs_cx) = self.window_methods.get(method_name) {
+                if let Some(&needs_cx) = WINDOW_METHODS.get(method_name) {
                     self.record_node_replacement(relative_path, &object, "window");
                     if needs_cx {
                         self.record_insertion_after_node(relative_path, arg, ", cx");
@@ -410,151 +410,6 @@ impl Refactor {
         }
         println!("Changed {} files", changed_files);
         Ok(())
-    }
-
-    fn build_window_methods() -> HashMap<&'static str, bool> {
-        [
-            ("window_handle", false),
-            ("refresh", true),
-            ("notify", true),
-            ("remove_window", true),
-            ("focused", true),
-            ("focus", true),
-            ("blur", true),
-            ("disable_focus", true),
-            ("text_system", false),
-            ("text_style", true),
-            ("is_maximized", false),
-            ("request_decorations", false),
-            ("start_window_resize", false),
-            ("window_bounds", false),
-            ("dispatch_action", true),
-            ("defer", true),
-            ("observe", true),
-            ("subscribe", true),
-            ("observe_release", true),
-            ("to_async", true),
-            ("on_next_frame", true),
-            ("request_animation_frame", true),
-            ("spawn", true),
-            ("bounds_changed", true),
-            ("bounds", false),
-            ("is_fullscreen", false),
-            ("appearance_changed", true),
-            ("appearance", false),
-            ("viewport_size", false),
-            ("is_window_active", false),
-            ("is_window_hovered", true),
-            ("zoom_window", false),
-            ("show_window_menu", false),
-            ("start_window_move", false),
-            ("set_client_inset", false),
-            ("window_decorations", false),
-            ("window_controls", false),
-            ("set_window_title", false),
-            ("set_app_id", false),
-            ("set_background_appearance", false),
-            ("set_window_edited", false),
-            ("display", true),
-            ("show_character_palette", false),
-            ("scale_factor", false),
-            ("rem_size", true),
-            ("set_rem_size", true),
-            ("with_rem_size", true),
-            ("line_height", true),
-            ("prevent_default", true),
-            ("default_prevented", false),
-            ("is_action_available", true),
-            ("mouse_position", false),
-            ("modifiers", false),
-            ("complete_frame", false),
-            ("draw", true),
-            ("present", false),
-            ("draw_roots", true),
-            ("prepaint_tooltip", true),
-            ("prepaint_deferred_draws", true),
-            ("paint_deferred_draws", true),
-            ("prepaint_index", false),
-            ("reuse_prepaint", true),
-            ("paint_index", false),
-            ("reuse_paint", true),
-            ("with_text_style", true),
-            ("set_cursor_style", true),
-            ("set_tooltip", true),
-            ("with_content_mask", true),
-            ("with_element_offset", true),
-            ("with_absolute_element_offset", true),
-            ("with_element_opacity", true),
-            ("transact", true),
-            ("request_autoscroll", true),
-            ("take_autoscroll", true),
-            ("use_asset", true),
-            ("element_offset", false),
-            ("element_opacity", false),
-            ("content_mask", false),
-            ("with_element_namespace", true),
-            ("with_element_state", true),
-            ("with_optional_element_state", true),
-            ("defer_draw", true),
-            ("paint_layer", true),
-            ("paint_shadows", true),
-            ("paint_quad", true),
-            ("paint_path", true),
-            ("paint_underline", true),
-            ("paint_strikethrough", true),
-            ("paint_glyph", true),
-            ("paint_emoji", true),
-            ("paint_svg", true),
-            ("paint_image", true),
-            ("paint_surface", true),
-            ("drop_image", true),
-            ("request_layout", true),
-            ("request_measured_layout", true),
-            ("compute_layout", true),
-            ("layout_bounds", true),
-            ("insert_hitbox", true),
-            ("set_key_context", true),
-            ("set_focus_handle", true),
-            ("set_view_id", true),
-            ("parent_view_id", false),
-            ("handle_input", true),
-            ("on_mouse_event", true),
-            ("on_key_event", true),
-            ("on_modifiers_changed", true),
-            ("on_focus_in", true),
-            ("on_focus_out", true),
-            ("reset_cursor_style", true),
-            ("dispatch_keystroke", true),
-            ("keystroke_text_for", true),
-            ("dispatch_event", true),
-            ("dispatch_mouse_event", true),
-            ("dispatch_key_event", true),
-            ("has_pending_keystrokes", false),
-            ("clear_pending_keystrokes", true),
-            ("pending_input_keystrokes", false),
-            ("replay_pending_input", true),
-            ("dispatch_action_on_node", true),
-            ("observe_global", true),
-            ("activate_window", false),
-            ("minimize_window", false),
-            ("toggle_fullscreen", false),
-            ("invalidate_character_coordinates", true),
-            ("prompt", true),
-            ("context_stack", true),
-            ("available_actions", true),
-            ("bindings_for_action", true),
-            ("all_bindings_for_input", true),
-            ("bindings_for_action_in", true),
-            ("listener_for", true),
-            ("handler_for", true),
-            ("on_window_should_close", true),
-            ("on_action", true),
-            ("gpu_specs", false),
-            ("get_raw_handle", false),
-        ]
-        .iter()
-        .cloned()
-        .collect()
     }
 }
 
