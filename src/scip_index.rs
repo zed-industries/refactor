@@ -149,19 +149,19 @@ impl Index {
         Ok(index.into())
     }
 
-    pub fn find_occurrence(
-        &self,
-        point: &tree_sitter::Point,
-        relative_path: &RelativePath,
-    ) -> Result<&Occurrence> {
+    pub fn document(&self, relative_path: &RelativePath) -> Result<&Document> {
+        self.documents
+            .get(relative_path)
+            .ok_or_else(|| anyhow::anyhow!("Document not found: {:?}", relative_path))
+    }
+}
+
+impl Document {
+    pub fn find_occurrence(&self, point: &tree_sitter::Point) -> Result<&Occurrence> {
         let line = point.row;
         let column = point.column;
-        let document = self
-            .documents
-            .get(relative_path)
-            .ok_or_else(|| anyhow::anyhow!("Document not found: {:?}", relative_path))?;
 
-        let occurrence_index = document
+        let occurrence_index = self
             .occurrences
             .binary_search_by(|occ| {
                 let start_line = occ.range[0] as usize;
@@ -176,13 +176,28 @@ impl Index {
             .map_err(|_| {
                 anyhow::anyhow!(
                     "Occurrence not found at {:?}:{}:{}",
-                    document.relative_path,
+                    self.relative_path,
                     line,
                     column
                 )
             })?;
 
-        Ok(&document.occurrences[occurrence_index])
+        Ok(&self.occurrences[occurrence_index])
+    }
+
+    pub fn find_local_definition(&self, local: LocalSymbol) -> Result<&Occurrence> {
+        self.occurrences
+            .iter()
+            .find(|occ| {
+                occ.has_role(SymbolRole::Definition) && occ.symbol == Symbol::Local(local.clone())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Local definition for `{}` not found in {:?}",
+                    local.0.clone(),
+                    self.relative_path
+                )
+            })
     }
 }
 

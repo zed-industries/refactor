@@ -115,9 +115,10 @@ impl Refactor {
 
         let function_occurrence = match self
             .index
-            .find_occurrence(&name_node.start_position(), relative_path)
+            .document(relative_path)
+            .and_then(|document| document.find_occurrence(&name_node.start_position()))
         {
-            Ok(occurrence) => occurrence,
+            Ok(function_occurrence) => function_occurrence,
             Err(e) => {
                 eprintln!("{}", e);
                 return;
@@ -128,19 +129,22 @@ impl Refactor {
 
         for_each_call(body_node, source, |call| {
             if let Some(method) = call.method {
-                match self
+                let method_occurrence = match self
                     .index
-                    .find_occurrence(&method.start_position(), relative_path)
+                    .document(relative_path)
+                    .and_then(|document| document.find_occurrence(&method.start_position()))
                 {
-                    Ok(method_occurrence) => {
-                        let method_symbol = method_occurrence.symbol.clone();
-                        self.caller_graph
-                            .entry(method_symbol)
-                            .or_insert_with(BTreeSet::new)
-                            .insert(parent_symbol.clone());
+                    Ok(method_occurrence) => method_occurrence,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        return;
                     }
-                    Err(e) => eprintln!("{}", e),
-                }
+                };
+                let method_symbol = method_occurrence.symbol.clone();
+                self.caller_graph
+                    .entry(method_symbol)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(parent_symbol.clone());
             }
         });
     }
