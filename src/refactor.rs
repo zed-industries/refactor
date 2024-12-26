@@ -3,7 +3,7 @@ use clap::Parser as ClapParser;
 use protobuf::Message;
 use scip::types::{
     symbol_information::Kind, DiagnosticTag, PositionEncoding, ProtocolVersion, Severity,
-    SyntaxKind, TextEncoding,
+    SymbolRole, SyntaxKind, TextEncoding,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -35,23 +35,25 @@ struct Refactor {
     caller_graph: HashMap<Symbol, BTreeSet<Symbol>>,
     transitive_window_context_callers: HashSet<Symbol>,
     window_methods: HashMap<&'static str, bool>,
-    edits: HashMap<PathBuf, Vec<Edit>>,
+    edits: HashMap<RelativePath, Vec<Edit>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Index {
     pub metadata: Arc<Metadata>,
-    pub documents: Vec<Document>,
-    pub external_symbols: Vec<SymbolInformation>,
+    pub documents: HashMap<RelativePath, Document>,
+    pub symbols: HashMap<GlobalSymbol, SymbolInformation>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RelativePath(Arc<Path>);
 
 #[derive(Debug, Clone)]
 pub struct Document {
+    pub relative_path: RelativePath,
     pub language: Arc<str>,
-    pub relative_path: Arc<str>,
     pub occurrences: Vec<Occurrence>,
-    pub symbols: Vec<SymbolInformation>,
-    pub text: Arc<str>,
+    pub locals: HashMap<LocalSymbol, SymbolInformation>,
     pub position_encoding: PositionEncoding,
 }
 
@@ -66,18 +68,42 @@ pub struct Occurrence {
     pub enclosing_range: Vec<i32>,
 }
 
+impl Occurrence {
+    fn has_role(&self, role: SymbolRole) -> bool {
+        self.symbol_roles & (role as i32) != 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Symbol(Arc<str>);
+pub enum Symbol {
+    Local(LocalSymbol),
+    Global(GlobalSymbol),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalSymbol(Arc<str>);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GlobalSymbol(Arc<str>);
 
 #[derive(Debug, Clone)]
 pub struct SymbolInformation {
-    pub symbol: Arc<str>,
+    pub symbol: Symbol,
     pub documentation: Vec<Arc<str>>,
     pub relationships: Vec<Relationship>,
     pub kind: Kind,
     pub display_name: Arc<str>,
-    pub signature_documentation: Option<Arc<Document>>,
+    pub signature_documentation: Option<Arc<SignatureDocumentation>>,
     pub enclosing_symbol: Arc<str>,
+}
+
+// In SCIP this is represented as a Document, but it's cleaner to have a separate type.
+#[derive(Debug, Clone)]
+pub struct SignatureDocumentation {
+    pub language: Arc<str>,
+    pub occurrences: Vec<Occurrence>,
+    pub locals: HashMap<LocalSymbol, SymbolInformation>,
+    pub text: Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,9 +207,12 @@ impl Refactor {
             })
         {
             let file_path = entry.path();
-            let relative_path = file_path
-                .strip_prefix(&self.index_folder)
-                .unwrap_or(file_path);
+            let relative_path = RelativePath(
+                file_path
+                    .strip_prefix(&self.index_folder)
+                    .unwrap_or(file_path)
+                    .into(),
+            );
             let mut file = File::open(file_path)?;
             let mut source = String::new();
             file.read_to_string(&mut source)?;
@@ -191,8 +220,8 @@ impl Refactor {
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            self.track_callers(relative_path, &source, root_node)?;
-            self.process_functions(relative_path, &source, root_node);
+            self.track_callers(&relative_path, &source, root_node)?;
+            self.process_functions(&relative_path, &source, root_node);
             // self.process_imports(relative_path, &source, root_node);
         }
 
@@ -203,7 +232,7 @@ impl Refactor {
 
     fn track_callers(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         source: &str,
         root_node: tree_sitter::Node,
     ) -> Result<()> {
@@ -216,7 +245,7 @@ impl Refactor {
 
     fn track_callers_in_function(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         source: &str,
         match_: FunctionMatch,
     ) {
@@ -254,15 +283,18 @@ impl Refactor {
     fn trace_window_context_callers(&mut self) {
         let mut to_process = Vec::new();
         for (callee, callers) in &self.caller_graph {
-            if callee.0.contains("WindowContext#") {
-                for caller in callers {
-                    if self
-                        .transitive_window_context_callers
-                        .insert(caller.clone())
-                    {
-                        to_process.push(caller.clone());
+            match callee {
+                Symbol::Global(symbol) if symbol.0.contains("WindowContext#") => {
+                    for caller in callers {
+                        if self
+                            .transitive_window_context_callers
+                            .insert(caller.clone())
+                        {
+                            to_process.push(caller.clone());
+                        }
                     }
                 }
+                _ => {}
             }
         }
 
@@ -287,7 +319,7 @@ impl Refactor {
 
     fn process_functions(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         source: &str,
         root_node: tree_sitter::Node,
     ) {
@@ -316,7 +348,7 @@ impl Refactor {
 
     fn process_call(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         source: &str,
         param_name: &str,
         call: CallMatch,
@@ -334,7 +366,7 @@ impl Refactor {
 
     fn process_cx_arg(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         source: &str,
         param_name: &str,
         call: &CallMatch,
@@ -368,7 +400,7 @@ impl Refactor {
 
     fn process_imports(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         source: &str,
         root_node: tree_sitter::Node,
     ) {
@@ -402,18 +434,17 @@ impl Refactor {
     fn find_occurrence(
         &self,
         point: &tree_sitter::Point,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
     ) -> Result<&Occurrence> {
         let line = point.row;
         let column = point.column;
         let document = self
             .index
             .documents
-            .binary_search_by(|doc| Path::new(doc.relative_path.as_ref()).cmp(relative_path))
-            .map_err(|_| anyhow::anyhow!("Document not found: {:?}", relative_path))?;
-        let doc = &self.index.documents[document];
+            .get(relative_path)
+            .ok_or_else(|| anyhow::anyhow!("Document not found: {:?}", relative_path))?;
 
-        let occurrence_index = doc
+        let occurrence_index = document
             .occurrences
             .binary_search_by(|occ| {
                 let start_line = occ.range[0] as usize;
@@ -428,18 +459,18 @@ impl Refactor {
             .map_err(|_| {
                 anyhow::anyhow!(
                     "Occurrence not found at {:?}:{}:{}",
-                    relative_path,
+                    document.relative_path,
                     line,
                     column
                 )
             })?;
 
-        Ok(&doc.occurrences[occurrence_index])
+        Ok(&document.occurrences[occurrence_index])
     }
 
     pub fn display_dry_run_results(&self) {
         for (path, edits) in &self.edits {
-            let path = &self.index_folder.join(path);
+            let path = &self.index_folder.join(path.0.clone());
             let mut file = File::open(path)
                 .with_context(|| format!("Failed to open file {:?}", path))
                 .unwrap();
@@ -487,7 +518,7 @@ impl Refactor {
 
     fn record_node_replacement(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         node: &tree_sitter::Node,
         replacement: &str,
     ) {
@@ -496,7 +527,7 @@ impl Refactor {
 
     fn record_insertion_before_node(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         node: &tree_sitter::Node,
         insertion: &str,
     ) {
@@ -506,7 +537,7 @@ impl Refactor {
 
     fn record_insertion_after_node(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         node: &tree_sitter::Node,
         insertion: &str,
     ) {
@@ -516,12 +547,12 @@ impl Refactor {
 
     fn record_edit(
         &mut self,
-        relative_path: &std::path::Path,
+        relative_path: &RelativePath,
         byte_range: Range<usize>,
         replacement: &str,
     ) {
         self.edits
-            .entry(relative_path.to_path_buf())
+            .entry(relative_path.clone())
             .or_default()
             .push(Edit {
                 byte_range,
@@ -532,7 +563,7 @@ impl Refactor {
     pub fn apply_edits(&mut self) -> Result<()> {
         let mut changed_files = 0;
         for (path, edits) in self.edits.iter_mut() {
-            let path = &self.index_folder.join(path);
+            let path = &self.index_folder.join(path.0.clone());
             let mut file =
                 File::open(path).with_context(|| format!("Failed to open file {:?}", path))?;
             let mut source = String::new();
@@ -1017,16 +1048,56 @@ const IMPORTS_QUERY_STR: &str = r#"
     )
     "#;
 
+// TODO: Complain about insertion of duplicates in all use of insert below
 impl From<scip::types::Index> for Index {
     fn from(index: scip::types::Index) -> Self {
+        let mut documents = HashMap::new();
+        let mut symbols = HashMap::new();
+        for document in index.documents.into_iter() {
+            let mut locals = HashMap::new();
+            for symbol_info in document.symbols {
+                let converted_symbol: SymbolInformation = symbol_info.into();
+                match converted_symbol.symbol.clone() {
+                    Symbol::Local(local) => {
+                        locals.insert(local, converted_symbol);
+                    }
+                    Symbol::Global(global) => {
+                        symbols.insert(global, converted_symbol);
+                    }
+                }
+            }
+
+            let relative_path = RelativePath(Path::new(&document.relative_path).into());
+            documents.insert(
+                relative_path.clone(),
+                Document {
+                    relative_path,
+                    language: document.language.into(),
+                    occurrences: document
+                        .occurrences
+                        .into_iter()
+                        .map(Occurrence::from)
+                        .collect(),
+                    locals,
+                    position_encoding: document.position_encoding.enum_value().unwrap(),
+                },
+            );
+        }
+        for symbol_info in index.external_symbols.into_iter() {
+            let converted_symbol: SymbolInformation = symbol_info.into();
+            match converted_symbol.symbol.clone() {
+                // TODO: Complain about local case
+                Symbol::Local(_) => {}
+                Symbol::Global(global) => {
+                    symbols.insert(global, converted_symbol);
+                }
+            }
+        }
+
         Index {
             metadata: Arc::new(Metadata::from(*index.metadata.0.unwrap())),
-            documents: index.documents.into_iter().map(Document::from).collect(),
-            external_symbols: index
-                .external_symbols
-                .into_iter()
-                .map(SymbolInformation::from)
-                .collect(),
+            documents,
+            symbols,
         }
     }
 }
@@ -1052,32 +1123,11 @@ impl From<scip::types::ToolInfo> for ToolInfo {
     }
 }
 
-impl From<scip::types::Document> for Document {
-    fn from(document: scip::types::Document) -> Self {
-        Document {
-            language: document.language.into(),
-            relative_path: document.relative_path.into(),
-            occurrences: document
-                .occurrences
-                .into_iter()
-                .map(Occurrence::from)
-                .collect(),
-            symbols: document
-                .symbols
-                .into_iter()
-                .map(SymbolInformation::from)
-                .collect(),
-            text: document.text.into(),
-            position_encoding: document.position_encoding.enum_value().unwrap(),
-        }
-    }
-}
-
 impl From<scip::types::Occurrence> for Occurrence {
     fn from(occurrence: scip::types::Occurrence) -> Self {
         Occurrence {
             range: occurrence.range,
-            symbol: Symbol(occurrence.symbol.into()),
+            symbol: occurrence.symbol.into(),
             symbol_roles: occurrence.symbol_roles,
             override_documentation: occurrence
                 .override_documentation
@@ -1091,6 +1141,16 @@ impl From<scip::types::Occurrence> for Occurrence {
                 .map(Diagnostic::from)
                 .collect(),
             enclosing_range: occurrence.enclosing_range,
+        }
+    }
+}
+
+impl From<String> for Symbol {
+    fn from(symbol: String) -> Self {
+        if symbol.starts_with("local ") {
+            Symbol::Local(LocalSymbol(symbol.into()))
+        } else {
+            Symbol::Global(GlobalSymbol(symbol.into()))
         }
     }
 }
@@ -1114,8 +1174,34 @@ impl From<scip::types::SymbolInformation> for SymbolInformation {
             signature_documentation: symbol_info
                 .signature_documentation
                 .0
-                .map(|doc| Arc::new(Document::from(*doc))),
+                .map(|doc| Arc::new(SignatureDocumentation::from(*doc))),
             enclosing_symbol: symbol_info.enclosing_symbol.into(),
+        }
+    }
+}
+
+impl From<scip::types::Document> for SignatureDocumentation {
+    fn from(document: scip::types::Document) -> Self {
+        let mut locals = HashMap::new();
+        for symbol_info in document.symbols.into_iter() {
+            let converted_symbol: SymbolInformation = symbol_info.into();
+            match converted_symbol.symbol.clone() {
+                Symbol::Local(local_symbol) => {
+                    locals.insert(local_symbol, converted_symbol);
+                }
+                // TODO: complain for this case.
+                Symbol::Global(_) => {}
+            }
+        }
+        SignatureDocumentation {
+            language: document.language.into(),
+            occurrences: document
+                .occurrences
+                .into_iter()
+                .map(Occurrence::from)
+                .collect(),
+            locals,
+            text: document.text.into(),
         }
     }
 }
@@ -1123,7 +1209,7 @@ impl From<scip::types::SymbolInformation> for SymbolInformation {
 impl From<scip::types::Relationship> for Relationship {
     fn from(relationship: scip::types::Relationship) -> Self {
         Relationship {
-            symbol: Symbol(relationship.symbol.into()),
+            symbol: relationship.symbol.into(),
             is_reference: relationship.is_reference,
             is_implementation: relationship.is_implementation,
             is_type_definition: relationship.is_type_definition,
