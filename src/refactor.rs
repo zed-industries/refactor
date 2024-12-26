@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use clap::Parser as ClapParser;
 use refactor::{
-    calls_query::*, functions_query::*, imports_query::*, scip_index::*, WINDOW_METHODS,
+    query_calls::*, query_functions::*, query_imports::*, scip_index::*, WINDOW_METHODS,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},

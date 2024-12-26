@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::LazyLock};
 
-pub mod calls_query;
-pub mod functions_query;
-pub mod imports_query;
+pub mod query_calls;
+pub mod query_functions;
+pub mod query_imports;
 pub mod scip_index;
 
 pub const WINDOW_METHODS: LazyLock<HashMap<&'static str, bool>> = LazyLock::new(|| {
