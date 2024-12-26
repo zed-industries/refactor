@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 default-run = "refactor"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "refactor"
 path = "src/refactor.rs"
