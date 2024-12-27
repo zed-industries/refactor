@@ -6,7 +6,7 @@ use scip::types::{
     SyntaxKind, TextEncoding,
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -31,9 +31,8 @@ struct Refactor {
     parser: Parser,
     index: Index,
     index_folder: PathBuf,
-    caller_graph: HashMap<Arc<str>, BTreeSet<Arc<str>>>,
-    path: PathBuf,
-    edits: HashMap<PathBuf, Vec<Edit>>,
+    caller_graph: BTreeMap<Arc<str>, BTreeSet<Arc<str>>>,
+    edits: BTreeMap<Arc<str>, Vec<Edit>>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,9 +133,8 @@ impl Refactor {
             parser,
             index,
             index_folder,
-            caller_graph: HashMap::new(),
-            path,
-            edits: HashMap::new(),
+            caller_graph: BTreeMap::new(),
+            edits: BTreeMap::new(),
         })
     }
 
@@ -329,7 +327,7 @@ impl Refactor {
         let documents = std::mem::take(&mut self.index.documents);
         let total_documents = documents.len();
         for (index, document) in documents.iter().enumerate() {
-            let relative_path = document.relative_path.as_ref();
+            let relative_path = &document.relative_path;
             let source = self.load_relative_path(relative_path)?;
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
@@ -357,7 +355,7 @@ impl Refactor {
         document: &Document,
         source: &str,
         root_node: Node,
-        relative_path: &str,
+        relative_path: &Arc<str>,
         needs_window: &BTreeSet<Arc<str>>,
     ) {
         let query = Self::parameters_query();
@@ -387,7 +385,7 @@ impl Refactor {
                     function_name_node.start_position().column,
                 ) {
                     Ok(occurrence) => occurrence.symbol.clone(),
-                    Err(e) => {
+                    Err(_) => {
                         continue;
                     }
                 };
@@ -399,7 +397,7 @@ impl Refactor {
                 if needs_window.contains(&function_symbol) {
                     let underscore = if param_name.starts_with('_') { "_" } else { "" };
                     self.edits
-                        .entry(PathBuf::from(relative_path))
+                        .entry(relative_path.clone())
                         .or_default()
                         .push(Edit {
                             start: param_start,
@@ -412,7 +410,7 @@ impl Refactor {
                         });
                 } else {
                     self.edits
-                        .entry(PathBuf::from(relative_path))
+                        .entry(relative_path.clone())
                         .or_default()
                         .push(Edit {
                             start: param_start,
@@ -424,7 +422,12 @@ impl Refactor {
         }
     }
 
-    fn stage_function_type_edits(&mut self, source: &str, root_node: Node, relative_path: &str) {
+    fn stage_function_type_edits(
+        &mut self,
+        source: &str,
+        root_node: Node,
+        relative_path: &Arc<str>,
+    ) {
         let query = Self::function_type_params_query();
         let param_ix = query.capture_index_for_name("parameter").unwrap();
         let param_type_ix = query.capture_index_for_name("parameter.type").unwrap();
@@ -442,7 +445,7 @@ impl Refactor {
                         let param_start = param_node.start_byte();
                         let param_end = param_node.end_byte();
                         self.edits
-                            .entry(PathBuf::from(relative_path))
+                            .entry(relative_path.clone())
                             .or_default()
                             .push(Edit {
                                 start: param_start,
@@ -455,7 +458,7 @@ impl Refactor {
         }
     }
 
-    fn stage_import_edits(&mut self, source: &str, root_node: Node, relative_path: &str) {
+    fn stage_import_edits(&mut self, source: &str, root_node: Node, relative_path: &Arc<str>) {
         let import_query = self.imports_query();
         let mut query_cursor = QueryCursor::new();
         let mut matches = query_cursor.matches(&import_query, root_node, source.as_bytes());
@@ -501,7 +504,7 @@ impl Refactor {
             }
             if !replacement.is_empty() {
                 self.edits
-                    .entry(PathBuf::from(relative_path))
+                    .entry(relative_path.clone())
                     .or_default()
                     .push(Edit {
                         start,
@@ -579,7 +582,8 @@ impl Refactor {
 
     pub fn display_dry_run_results(&self) {
         for (path, edits) in &self.edits {
-            let mut file = File::open(&self.index_folder.join(path)).expect("Failed to open file");
+            let mut file =
+                File::open(&self.index_folder.join(path.as_ref())).expect("Failed to open file");
             let mut source = String::new();
             file.read_to_string(&mut source)
                 .expect("Failed to read file");
@@ -613,7 +617,7 @@ impl Refactor {
     pub fn apply_edits(&mut self) -> Result<()> {
         let total_files = self.edits.len();
         for (path, edits) in self.edits.iter_mut() {
-            let full_path = self.index_folder.join(path);
+            let full_path = self.index_folder.join(path.as_ref());
             let mut file = File::open(&full_path).context("Failed to open file")?;
             let mut source = String::new();
             file.read_to_string(&mut source)
@@ -631,72 +635,6 @@ impl Refactor {
         }
         println!("\r\u{1b}[KChanged {} files", total_files);
         Ok(())
-    }
-
-    fn function_query(&self) -> &'static str {
-        r#"
-            [
-              (function_item
-                name: (identifier) @function_name
-                parameters: (parameters
-                  (parameter
-                    pattern: (identifier) @param_name
-                    type: (reference_type
-                      (mutable_specifier)?
-                      type: (type_identifier) @param_type
-                    )
-                  ) @target_param
-                )
-                body: (block) @function_body
-              )
-              (#eq? @param_type "WindowContext")
-              (function_signature_item
-                name: (identifier) @function_name
-                parameters: (parameters
-                  (parameter
-                    pattern: (identifier) @param_name
-                    type: (reference_type
-                      (mutable_specifier)?
-                      type: (type_identifier) @param_type
-                    )
-                  ) @target_param
-                )
-              )
-              (#eq? @param_type "WindowContext")
-              (function_type
-                parameters: (parameters
-                  (reference_type
-                    (mutable_specifier)?
-                    type: (generic_type
-                      type: (type_identifier) @param_type
-                      type_arguments: (type_arguments
-                        (lifetime)?
-                      )
-                    )
-                  ) @target_param
-                )
-              )
-              (#eq? @param_type "WindowContext")
-              (impl_item
-                body: (declaration_list
-                  (function_item
-                    name: (identifier) @function_name
-                    parameters: (parameters
-                      (self_parameter)?
-                      (parameter
-                        type: (reference_type
-                          (mutable_specifier)?
-                          type: (type_identifier) @param_type
-                        )
-                      ) @target_param
-                    )
-                    body: (block) @function_body
-                  )
-                )
-              )
-              (#eq? @param_type "WindowContext")
-            ]
-        "#
     }
 }
 
