@@ -3,13 +3,21 @@
     name: (identifier) @function.name
     parameters: (parameters
         (parameter
-            pattern: ((identifier) @parameter.name)
+            pattern: (identifier)? @parameter.name
             type:
                 (reference_type
                     type: [
                         (type_identifier) @parameter.type
                         (scoped_type_identifier
                             name: (type_identifier) @parameter.type
+                        )
+                        (generic_type
+                            type: [
+                                (type_identifier) @parameter.type
+                                (scoped_type_identifier
+                                    name: (type_identifier) @parameter.type
+                                )
+                            ]
                         )
                     ]
                 )
@@ -29,6 +37,15 @@
                     (scoped_type_identifier
                         name: (type_identifier) @parameter.type
                     )
+                    (generic_type
+                        type: [
+                            (type_identifier) @parameter.type
+                            (scoped_type_identifier
+                                name: (type_identifier) @parameter.type
+                            )
+                        ]
+                    )
+
                 ]
             )
         ) @parameter

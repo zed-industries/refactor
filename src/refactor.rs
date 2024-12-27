@@ -177,6 +177,7 @@ impl Refactor {
     }
 
     pub fn process(&mut self) -> Result<()> {
+        Self::function_type_params_query();
         Self::parameters_query();
 
         self.build_caller_graph()?;
@@ -331,14 +332,26 @@ impl Refactor {
 
     fn stage_edits(&mut self, need_window: &BTreeSet<Arc<str>>) -> Result<()> {
         let documents = std::mem::take(&mut self.index.documents);
-        for document in &documents {
+        let total_documents = documents.len();
+        for (index, document) in documents.iter().enumerate() {
             let relative_path = document.relative_path.as_ref();
             let source = self.load_relative_path(relative_path)?;
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
             self.stage_param_edits(document, &source, root_node, relative_path, need_window);
+            self.stage_function_type_edits(&source, root_node, relative_path);
+
+            let progress = (index + 1) as f32 / total_documents as f32;
+            print!(
+                "\r\u{1b}[KStaging edits – {}/{} documents ({:.1}%)",
+                index + 1,
+                total_documents,
+                progress * 100.0
+            );
+            std::io::stdout().flush().unwrap();
         }
+        println!("");
         self.index.documents = documents;
         Ok(())
     }
@@ -366,10 +379,7 @@ impl Refactor {
                 }
 
                 let param_node = match_.nodes_for_capture_index(param_ix).next().unwrap();
-                let param_name_node = match_
-                    .nodes_for_capture_index(param_name_ix)
-                    .next()
-                    .unwrap();
+                let param_name_node = match_.nodes_for_capture_index(param_name_ix).next();
                 let function_name_node = match_
                     .nodes_for_capture_index(function_name_ix)
                     .next()
@@ -382,12 +392,11 @@ impl Refactor {
                 ) {
                     Ok(occurrence) => occurrence.symbol.clone(),
                     Err(e) => {
-                        eprintln!("Error finding function occurrence: {}", e);
                         continue;
                     }
                 };
 
-                let param_name = &source[param_name_node.byte_range()];
+                let param_name = param_name_node.map_or("_", |node| &source[node.byte_range()]);
                 let param_start = param_node.start_byte();
                 let param_end = param_node.end_byte();
 
@@ -419,6 +428,42 @@ impl Refactor {
         }
     }
 
+    fn stage_function_type_edits(
+        &mut self,
+        source: &str,
+        root_node: tree_sitter::Node,
+        relative_path: &str,
+    ) {
+        let query = Self::function_type_params_query();
+        let param_ix = query.capture_index_for_name("parameter").unwrap();
+        let param_type_ix = query.capture_index_for_name("parameter.type").unwrap();
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root_node, source.as_bytes());
+
+        while let Some(match_) = matches.next() {
+            for capture in match_.captures {
+                if capture.index == param_type_ix {
+                    let param_type = &source[capture.node.byte_range()];
+
+                    if param_type == "WindowContext" {
+                        let param_node = match_.nodes_for_capture_index(param_ix).next().unwrap();
+                        let param_start = param_node.start_byte();
+                        let param_end = param_node.end_byte();
+                        self.edits
+                            .entry(PathBuf::from(relative_path))
+                            .or_default()
+                            .push(Edit {
+                                start: param_start,
+                                end: param_end,
+                                replacement: "&mut Window, &mut AppContext".to_string(),
+                            });
+                    }
+                }
+            }
+        }
+    }
+
     fn load_relative_path(&self, relative_path: &str) -> Result<String> {
         let file_path = self.index_folder.join(relative_path);
         let mut file = File::open(&file_path)?;
@@ -439,6 +484,14 @@ impl Refactor {
         Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
             include_str!("./parameters.scm"),
+        )
+        .expect("Failed to create query")
+    }
+
+    fn function_type_params_query() -> Query {
+        Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            include_str!("./function_type_parameters.scm"),
         )
         .expect("Failed to create query")
     }
@@ -787,9 +840,10 @@ impl Refactor {
     }
 
     pub fn apply_edits(&mut self) -> Result<()> {
-        let mut changed_files = 0;
+        let total_files = self.edits.len();
         for (path, edits) in self.edits.iter_mut() {
-            let mut file = File::open(path).context("Failed to open file")?;
+            let full_path = self.index_folder.join(path);
+            let mut file = File::open(&full_path).context("Failed to open file")?;
             let mut source = String::new();
             file.read_to_string(&mut source)
                 .context("Failed to read file")?;
@@ -800,10 +854,11 @@ impl Refactor {
                 new_source.replace_range(edit.start..edit.end, &edit.replacement);
             }
 
-            std::fs::write(path, new_source).context("Failed to write file")?;
-            changed_files += 1;
+            std::fs::write(full_path, new_source).context("Failed to write file")?;
+
+            std::io::stdout().flush().unwrap();
         }
-        println!("Changed {} files", changed_files);
+        println!("\r\u{1b}[KChanged {} files", total_files);
         Ok(())
     }
 
