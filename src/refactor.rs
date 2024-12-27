@@ -173,7 +173,7 @@ impl Refactor {
     }
 
     pub fn process(&mut self) -> Result<()> {
-        self.build_caller_graph()?;
+        self.analyze()?;
         let mut window_context_methods = self.find_window_context_methods()?;
         let need_window = self.find_transitive_callers(&mut window_context_methods);
         self.stage_edits(&need_window)?;
@@ -181,90 +181,100 @@ impl Refactor {
         Ok(())
     }
 
-    fn build_caller_graph(&mut self) -> Result<()> {
-        for (index, document) in self.index.documents.iter().enumerate() {
-            let relative_path = document.relative_path.as_ref();
-            let source = self.load_relative_path(relative_path)?;
-            let tree = self.parser.parse(&source, None).unwrap();
-            let root_node = tree.root_node();
+    // A read-only pass on every document to compute metadata, index relationships
+    fn analyze(&mut self) -> Result<()> {
+        let mut documents = std::mem::take(&mut self.index.documents);
+        let document_count = documents.len();
+        for (index, document) in documents.iter_mut().enumerate() {
+            self.analyze_calls(document)?;
 
-            let query = Self::functions_query();
-            let function_item_name_ix = query.capture_index_for_name("function_item.name").unwrap();
-            let function_item_ix = query.capture_index_for_name("function_item").unwrap();
-            let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&query, root_node, source.as_bytes());
-
-            while let Some(match_) = matches.next() {
-                let function_item = match_
-                    .nodes_for_capture_index(function_item_ix)
-                    .next()
-                    .unwrap();
-                let function_name = match_
-                    .nodes_for_capture_index(function_item_name_ix)
-                    .next()
-                    .unwrap();
-
-                let definition_symbol = match document.occurrences.binary_search_by(|occ| {
-                    occ.range.row.cmp(&function_name.start_position().row).then(
-                        occ.range
-                            .start_column
-                            .cmp(&function_name.start_position().column),
-                    )
-                }) {
-                    Ok(index) => &document.occurrences[index].symbol,
-                    Err(_) => {
-                        // We may find definitions syntactically that aren't in the current SCIP index.
-                        continue;
-                    }
-                };
-
-                let function_item_range = function_item.range();
-                let child_occurences_start = match document.occurrences.binary_search_by(|occ| {
-                    occ.range
-                        .row
-                        .cmp(&function_item_range.start_point.row)
-                        .then(
-                            occ.range
-                                .start_column
-                                .cmp(&function_item_range.start_point.column),
-                        )
-                }) {
-                    Ok(index) => index,
-                    Err(index) => index,
-                };
-                let child_occurences_end = match document.occurrences.binary_search_by(|occ| {
-                    occ.range.row.cmp(&function_item_range.end_point.row).then(
-                        occ.range
-                            .end_column
-                            .cmp(&function_item_range.end_point.column),
-                    )
-                }) {
-                    Ok(index) => index + 1,
-                    Err(index) => index,
-                };
-
-                for child_occurrence in document.occurrences
-                    [child_occurences_start..child_occurences_end]
-                    .iter()
-                    .filter(|occ| occ.symbol_roles == 0 && occ.symbol.ends_with("()."))
-                {
-                    self.caller_graph
-                        .entry(child_occurrence.symbol.clone())
-                        .or_insert_with(BTreeSet::new)
-                        .insert(definition_symbol.clone());
-                }
-            }
-
-            let progress = (index + 1) as f32 / self.index.documents.len() as f32;
+            let progress = (index + 1) as f32 / document_count as f32;
             print!(
-                "\r\u{1b}[KBuilding caller graph – {}/{} documents ({:.1}%)",
+                "\r\u{1b}[KAnalyzing – {}/{} documents ({:.1}%)",
                 index + 1,
-                self.index.documents.len(),
+                document_count,
                 progress * 100.0
             );
             std::io::stdout().flush().unwrap();
         }
+        self.index.documents = documents;
         println!("");
+
+        Ok(())
+    }
+
+    fn analyze_calls(&mut self, document: &Document) -> Result<()> {
+        let relative_path = document.relative_path.as_ref();
+        let source = self.load_relative_path(relative_path)?;
+        let tree = self.parser.parse(&source, None).unwrap();
+        let root_node = tree.root_node();
+
+        let query = Self::functions_query();
+        let function_item_name_ix = query.capture_index_for_name("function_item.name").unwrap();
+        let function_item_ix = query.capture_index_for_name("function_item").unwrap();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root_node, source.as_bytes());
+
+        while let Some(match_) = matches.next() {
+            let function_item = match_
+                .nodes_for_capture_index(function_item_ix)
+                .next()
+                .unwrap();
+            let function_name = match_
+                .nodes_for_capture_index(function_item_name_ix)
+                .next()
+                .unwrap();
+
+            let definition_symbol = match document.occurrences.binary_search_by(|occ| {
+                occ.range.row.cmp(&function_name.start_position().row).then(
+                    occ.range
+                        .start_column
+                        .cmp(&function_name.start_position().column),
+                )
+            }) {
+                Ok(index) => &document.occurrences[index].symbol,
+                Err(_) => {
+                    // We may find definitions syntactically that aren't in the current SCIP index.
+                    continue;
+                }
+            };
+
+            let function_item_range = function_item.range();
+            let child_occurences_start = match document.occurrences.binary_search_by(|occ| {
+                occ.range
+                    .row
+                    .cmp(&function_item_range.start_point.row)
+                    .then(
+                        occ.range
+                            .start_column
+                            .cmp(&function_item_range.start_point.column),
+                    )
+            }) {
+                Ok(index) => index,
+                Err(index) => index,
+            };
+            let child_occurences_end = match document.occurrences.binary_search_by(|occ| {
+                occ.range.row.cmp(&function_item_range.end_point.row).then(
+                    occ.range
+                        .end_column
+                        .cmp(&function_item_range.end_point.column),
+                )
+            }) {
+                Ok(index) => index + 1,
+                Err(index) => index,
+            };
+
+            for child_occurrence in document.occurrences
+                [child_occurences_start..child_occurences_end]
+                .iter()
+                .filter(|occ| occ.symbol_roles == 0 && occ.symbol.ends_with("()."))
+            {
+                self.caller_graph
+                    .entry(child_occurrence.symbol.clone())
+                    .or_insert_with(BTreeSet::new)
+                    .insert(definition_symbol.clone());
+            }
+        }
 
         Ok(())
     }
@@ -338,7 +348,7 @@ impl Refactor {
 
             let progress = (index + 1) as f32 / total_documents as f32;
             print!(
-                "\r\u{1b}[KStaging edits – {}/{} documents ({:.1}%)",
+                "\r\u{1b}[KStaging Edits – {}/{} documents ({:.1}%)",
                 index + 1,
                 total_documents,
                 progress * 100.0
