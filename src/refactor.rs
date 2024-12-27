@@ -9,12 +9,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Read, Write},
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
 };
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Parser, Query, QueryCursor, TreeCursor};
+use tree_sitter::{Node, Parser, Point, Query, QueryCursor, TreeCursor};
 
 #[derive(ClapParser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -59,20 +60,13 @@ pub struct Document {
 
 #[derive(Debug, Clone)]
 pub struct Occurrence {
-    pub range: OccurenceRange,
+    pub range: Range<Point>,
     pub symbol: Arc<str>,
     pub symbol_roles: i32,
     pub override_documentation: Vec<Arc<str>>,
     pub syntax_kind: SyntaxKind,
     pub diagnostics: Vec<Diagnostic>,
     pub enclosing_range: Vec<i32>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OccurenceRange {
-    row: usize,
-    start_column: usize,
-    end_column: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -236,13 +230,11 @@ impl Refactor {
                 .next()
                 .unwrap();
 
-            let definition_symbol = match document.occurrences.binary_search_by(|occ| {
-                occ.range.row.cmp(&function_name.start_position().row).then(
-                    occ.range
-                        .start_column
-                        .cmp(&function_name.start_position().column),
-                )
-            }) {
+            let definition_symbol = match document
+                .occurrences
+                .binary_search_by_key(&function_name.start_position(), |occurrence| {
+                    occurrence.range.start
+                }) {
                 Ok(index) => &document.occurrences[index].symbol,
                 Err(_) => {
                     // We may find definitions syntactically that aren't in the current SCIP index.
@@ -251,26 +243,19 @@ impl Refactor {
             };
 
             let function_item_range = function_item.range();
-            let child_occurences_start = match document.occurrences.binary_search_by(|occ| {
-                occ.range
-                    .row
-                    .cmp(&function_item_range.start_point.row)
-                    .then(
-                        occ.range
-                            .start_column
-                            .cmp(&function_item_range.start_point.column),
-                    )
-            }) {
+            let child_occurences_start = match document
+                .occurrences
+                .binary_search_by_key(&function_item_range.start_point, |occurrence| {
+                    occurrence.range.start
+                }) {
                 Ok(index) => index,
                 Err(index) => index,
             };
-            let child_occurences_end = match document.occurrences.binary_search_by(|occ| {
-                occ.range.row.cmp(&function_item_range.end_point.row).then(
-                    occ.range
-                        .end_column
-                        .cmp(&function_item_range.end_point.column),
-                )
-            }) {
+            let child_occurences_end = match document
+                .occurrences
+                .binary_search_by_key(&function_item_range.end_point, |occurrence| {
+                    occurrence.range.end
+                }) {
                 Ok(index) => index + 1,
                 Err(index) => index,
             };
@@ -278,7 +263,9 @@ impl Refactor {
             for child_occurrence in document.occurrences
                 [child_occurences_start..child_occurences_end]
                 .iter()
-                .filter(|occ| occ.symbol_roles == 0 && occ.symbol.ends_with("()."))
+                .filter(|occurrence| {
+                    occurrence.symbol_roles == 0 && occurrence.symbol.ends_with("().")
+                })
             {
                 self.caller_graph
                     .entry(child_occurrence.symbol.clone())
@@ -491,16 +478,13 @@ impl Refactor {
                     .next()
                     .unwrap();
 
-                let function_symbol = match self.find_occurrence(
-                    document,
-                    function_name_node.start_position().row,
-                    function_name_node.start_position().column,
-                ) {
-                    Ok(occurrence) => occurrence.symbol.clone(),
-                    Err(_) => {
-                        continue;
-                    }
-                };
+                let function_symbol =
+                    match self.find_occurrence(document, function_name_node.start_position()) {
+                        Ok(occurrence) => occurrence.symbol.clone(),
+                        Err(_) => {
+                            continue;
+                        }
+                    };
 
                 let param_name = param_name_node.map_or("_", |node| &source[node.byte_range()]);
                 let param_start = param_node.start_byte();
@@ -664,24 +648,12 @@ impl Refactor {
     fn find_occurrence<'a>(
         &self,
         document: &'a Document,
-        line: usize,
-        column: usize,
+        start_point: Point,
     ) -> Result<&'a Occurrence> {
         let occurrence_index = document
             .occurrences
-            .binary_search_by(|occ| {
-                let start_row = occ.range.row;
-                let start_column = occ.range.start_column;
-
-                if start_row != line {
-                    start_row.cmp(&line)
-                } else {
-                    start_column.cmp(&column)
-                }
-            })
-            .map_err(|_| {
-                anyhow::anyhow!("Occurrence not found at line {} column {}", line, column)
-            })?;
+            .binary_search_by_key(&start_point, |occurrence| occurrence.range.start)
+            .map_err(|_| anyhow::anyhow!("Occurrence not found at {:?}", start_point))?;
 
         Ok(&document.occurrences[occurrence_index])
     }
@@ -802,12 +774,19 @@ impl From<scip::types::Document> for Document {
 
 impl From<scip::types::Occurrence> for Occurrence {
     fn from(occurrence: scip::types::Occurrence) -> Self {
-        Occurrence {
-            range: OccurenceRange {
-                row: occurrence.range[0] as usize,
-                start_column: occurrence.range[1] as usize,
-                end_column: occurrence.range[2] as usize,
+        let range = match occurrence.range.len() {
+            3 => Range {
+                start: Point::new(occurrence.range[0] as usize, occurrence.range[1] as usize),
+                end: Point::new(occurrence.range[0] as usize, occurrence.range[2] as usize),
             },
+            4 => Range {
+                start: Point::new(occurrence.range[0] as usize, occurrence.range[1] as usize),
+                end: Point::new(occurrence.range[2] as usize, occurrence.range[3] as usize),
+            },
+            l => panic!("SCIP Occurrence.range has {l} values when 3 or 4 are expected."),
+        };
+        Occurrence {
+            range: range,
             symbol: occurrence.symbol.into(),
             symbol_roles: occurrence.symbol_roles,
             override_documentation: occurrence
