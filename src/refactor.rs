@@ -14,7 +14,7 @@ use std::{
     time::SystemTime,
 };
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Parser, Query, QueryCursor};
+use tree_sitter::{Node, Parser, Query, QueryCursor, TreeCursor};
 
 #[derive(ClapParser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -183,9 +183,9 @@ impl Refactor {
 
     pub fn process(&mut self) -> Result<()> {
         self.analyze()?;
-        let mut window_context_methods = self.find_window_context_methods()?;
-        let need_window = self.find_transitive_callers(&mut window_context_methods);
-        self.stage_edits(&need_window)?;
+        // let mut window_context_methods = self.find_window_context_methods()?;
+        // let need_window = self.find_transitive_callers(&mut window_context_methods);
+        // self.stage_edits(&need_window)?;
 
         Ok(())
     }
@@ -195,7 +195,11 @@ impl Refactor {
         let mut documents = std::mem::take(&mut self.index.documents);
         let document_count = documents.len();
         for (index, document) in documents.iter_mut().enumerate() {
-            self.analyze_calls(document)?;
+            let relative_path = document.relative_path.as_ref();
+            let source = self.load_relative_path(relative_path)?;
+            let tree = self.parser.parse(&source, None).unwrap();
+            // self.analyze_call_graph(document, tree.root_node())?;
+            self.analyze_fn_params(document, tree.root_node(), &source);
 
             let progress = (index + 1) as f32 / document_count as f32;
             print!(
@@ -212,17 +216,15 @@ impl Refactor {
         Ok(())
     }
 
-    fn analyze_calls(&mut self, document: &Document) -> Result<()> {
+    fn analyze_call_graph(&mut self, document: &Document, node: Node) -> Result<()> {
         let relative_path = document.relative_path.as_ref();
         let source = self.load_relative_path(relative_path)?;
-        let tree = self.parser.parse(&source, None).unwrap();
-        let root_node = tree.root_node();
 
         let query = &self.functions_query;
         let function_item_name_ix = query.capture_index_for_name("function_item.name").unwrap();
         let function_item_ix = query.capture_index_for_name("function_item").unwrap();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, root_node, source.as_bytes());
+        let mut matches = cursor.matches(&query, node, source.as_bytes());
 
         while let Some(match_) = matches.next() {
             let function_item = match_
@@ -288,6 +290,97 @@ impl Refactor {
         Ok(())
     }
 
+    /// Find all "sparse paths" through the Tree-Sitter parse tree
+    /// that match the sequence PATTERN in order.
+    fn analyze_fn_params(&mut self, _document: &Document, node: Node, source: &str) {
+        let pattern = [
+            "function_item",
+            "parameters",
+            "function_type",
+            "parameters",
+            "type_identifier",
+        ];
+
+        self.find_sparse_path_matches(&node, &pattern, source, |path| {
+            let node = path.last().unwrap();
+            if node.kind() == "type_identifier" && &source[node.byte_range()] == "WindowContext" {
+                let function_item = path.first().unwrap().child_by_field_name("name").unwrap();
+                let function_name = function_item.utf8_text(source.as_bytes()).unwrap();
+                let line = function_item.start_position().row + 1;
+                let start_byte = source[..node.start_byte()].rfind('\n').map_or(0, |i| i + 1);
+                let end_byte = source[node.end_byte()..]
+                    .find('\n')
+                    .map_or(source.len(), |i| node.end_byte() + i);
+                let context_line = &source[start_byte..end_byte];
+
+                println!("Found match in function: {} (line {})", function_name, line);
+                println!("Context: {}", context_line);
+            }
+        });
+    }
+
+    fn find_sparse_path_matches<F>(
+        &self,
+        node: &Node,
+        pattern: &[&str],
+        source: &str,
+        mut callback: F,
+    ) where
+        F: FnMut(&[Node]),
+    {
+        let mut cursor = node.walk();
+        let mut current_path = Vec::new();
+
+        fn dfs<'a, F>(
+            cursor: &mut TreeCursor<'a>,
+            current_path: &mut Vec<Node<'a>>,
+            pattern_index: usize,
+            pattern: &[&str],
+            source: &str,
+            callback: &mut F,
+        ) where
+            F: FnMut(&[Node]),
+        {
+            let node = cursor.node();
+
+            let mut next_index = pattern_index;
+            if node.kind() == pattern[pattern_index] {
+                next_index += 1;
+                current_path.push(node);
+
+                if next_index == pattern.len() {
+                    callback(current_path);
+                    current_path.pop();
+                }
+            }
+
+            if cursor.goto_first_child() {
+                loop {
+                    dfs(cursor, current_path, next_index, pattern, source, callback);
+
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+                cursor.goto_parent();
+            }
+
+            if next_index > pattern_index && current_path.last().map(|n| n.id()) == Some(node.id())
+            {
+                current_path.pop();
+            }
+        }
+
+        dfs(
+            &mut cursor,
+            &mut current_path,
+            0,
+            pattern,
+            source,
+            &mut callback,
+        );
+    }
+
     fn find_window_context_methods(&self) -> Result<BTreeSet<Arc<str>>> {
         let window_rs_path = "crates/gpui/src/window.rs";
         let document_index = self
@@ -303,7 +396,7 @@ impl Refactor {
         let mut window_context_methods = BTreeSet::new();
 
         for symbol in &document.symbols {
-            if symbol.symbol.contains("/WindowContext") {
+            if symbol.symbol.contains("/WindowContext#") {
                 if let Kind::Method = symbol.kind {
                     let hash_count = symbol.symbol.matches('#').count();
                     if hash_count == 1 {
@@ -373,13 +466,13 @@ impl Refactor {
         &mut self,
         document: &Document,
         source: &str,
-        root_node: Node,
+        node: Node,
         relative_path: &Arc<str>,
         needs_window: &BTreeSet<Arc<str>>,
     ) {
         let query = &self.parameters_query;
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, root_node, source.as_bytes());
+        let mut matches = cursor.matches(&query, node, source.as_bytes());
         let param_ix = query.capture_index_for_name("parameter").unwrap();
         let param_name_ix = query.capture_index_for_name("parameter.name").unwrap();
         let function_name_ix = query.capture_index_for_name("function.name").unwrap();
@@ -441,18 +534,13 @@ impl Refactor {
         }
     }
 
-    fn stage_function_type_edits(
-        &mut self,
-        source: &str,
-        root_node: Node,
-        relative_path: &Arc<str>,
-    ) {
+    fn stage_function_type_edits(&mut self, source: &str, node: Node, relative_path: &Arc<str>) {
         let query = &self.function_type_parameters_query;
         let param_ix = query.capture_index_for_name("parameter").unwrap();
         let param_type_ix = query.capture_index_for_name("parameter.type").unwrap();
 
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&query, root_node, source.as_bytes());
+        let mut matches = cursor.matches(&query, node, source.as_bytes());
 
         while let Some(match_) = matches.next() {
             for capture in match_.captures {
@@ -560,7 +648,7 @@ impl Refactor {
     fn parse_function_type_params_query() -> Query {
         Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
-            include_str!("./function_type_parameters.scm"),
+            include_str!("./function_type_params.scm"),
         )
         .expect("Failed to create query")
     }
