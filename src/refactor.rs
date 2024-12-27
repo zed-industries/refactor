@@ -307,50 +307,34 @@ impl Refactor {
               name: (identifier) @function_item.name
               parameters: (parameters
                 (parameter
-                  type: [(reference_type
-                    type: [(type_identifier) @function.param.type (scoped_type_identifier name: (type_identifier) @function.param.type)])
+                  type: [
+                    (reference_type
+                      type: [
                         (type_identifier) @function.param.type
-                        (scoped_type_identifier name: (type_identifier) @function.param.type)]))) @function_item
+                        (scoped_type_identifier
+                          name: (type_identifier) @function.param.type
+                        )
+                      ]
+                    )
+                  ]
+                )
+              )
+            ) @function_item
 
             ; Function signature parameters
             (function_signature_item
               parameters: (parameters
                 (parameter
-                  type: [(type_identifier) @function_sig.param.type (scoped_type_identifier name: (type_identifier) @function_sig.param.type)])))
+                  type: (reference_type
+                    type: [(type_identifier) @function_sig.param.type (scoped_type_identifier name: (type_identifier) @function_sig.param.type)]))))
 
             ; Closure parameters
             (closure_expression
-              parameters: (closure_parameters
+                parameters: (closure_parameters
                 (parameter
-                  type: [(type_identifier) @closure.param.type (scoped_type_identifier name: (type_identifier) @closure.param.type)])))
+                    type: (reference_type
+                    type: [(type_identifier) @closure.param.type (scoped_type_identifier name: (type_identifier) @closure.param.type)]))))
 
-            ; Function pointer types in parameters
-            (parameter
-              type: (function_type
-                parameters: (parameters
-                  (type_identifier) @fn_ptr.param.type)))
-
-            ; Generic function parameters with trait bounds
-            (function_item
-              type_parameters: (type_parameters
-                (constrained_type_parameter
-                  bounds: (trait_bounds
-                    (type_identifier) @generic_bound.type))))
-
-            ; Reference types in parameters
-            (parameter
-              type: (reference_type
-                type: [(type_identifier) @ref.param.type (scoped_type_identifier name: (type_identifier) @ref.param.type)]))
-
-            ; Pointer types in parameters
-            (parameter
-              type: (pointer_type
-                type: [(type_identifier) @ptr.param.type (scoped_type_identifier name: (type_identifier) @ptr.param.type)]))
-
-            ; Tuple struct patterns in parameters
-            (parameter
-              pattern: (tuple_struct_pattern
-                type: [(identifier) @tuple_struct.param.type (scoped_identifier name: (identifier) @tuple_struct.param.type)]))
             "#,
         )
         .expect("Failed to create query")
