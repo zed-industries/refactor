@@ -7,7 +7,6 @@ use scip::types::{
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    f64::consts::LOG2_E,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -178,15 +177,12 @@ impl Refactor {
     }
 
     pub fn process(&mut self) -> Result<()> {
+        Self::parameters_query();
+
         self.build_caller_graph()?;
         let mut window_context_methods = self.find_window_context_methods()?;
         let need_window = self.find_transitive_callers(&mut window_context_methods);
-        self.prepare_edits(&need_window)?;
-
-        println!("Transitive callers:");
-        for caller in &need_window {
-            println!("  {}", caller);
-        }
+        self.stage_edits(&need_window)?;
 
         Ok(())
     }
@@ -333,9 +329,7 @@ impl Refactor {
         visited
     }
 
-    fn prepare_edits(&mut self, need_window: &BTreeSet<Arc<str>>) -> Result<Vec<Edit>> {
-        let mut edits = Vec::new();
-
+    fn stage_edits(&mut self, need_window: &BTreeSet<Arc<str>>) -> Result<()> {
         let documents = std::mem::take(&mut self.index.documents);
         for document in &documents {
             let relative_path = document.relative_path.as_ref();
@@ -343,14 +337,13 @@ impl Refactor {
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            self.process_params(document, &source, root_node, relative_path, need_window);
+            self.stage_param_edits(document, &source, root_node, relative_path, need_window);
         }
         self.index.documents = documents;
-
-        Ok(edits)
+        Ok(())
     }
 
-    fn process_params(
+    fn stage_param_edits(
         &mut self,
         document: &Document,
         source: &str,
@@ -361,6 +354,9 @@ impl Refactor {
         let query = Self::parameters_query();
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root_node, source.as_bytes());
+        let param_ix = query.capture_index_for_name("parameter").unwrap();
+        let param_name_ix = query.capture_index_for_name("parameter.name").unwrap();
+        let function_name_ix = query.capture_index_for_name("function.name").unwrap();
 
         while let Some(match_) = matches.next() {
             for capture in match_.captures {
@@ -369,9 +365,56 @@ impl Refactor {
                     continue;
                 }
 
-                let start_pos = capture.node.start_position();
-                let line = source.lines().nth(start_pos.row).unwrap_or("");
-                println!("Capture: {}", line);
+                let param_node = match_.nodes_for_capture_index(param_ix).next().unwrap();
+                let param_name_node = match_
+                    .nodes_for_capture_index(param_name_ix)
+                    .next()
+                    .unwrap();
+                let function_name_node = match_
+                    .nodes_for_capture_index(function_name_ix)
+                    .next()
+                    .unwrap();
+
+                let function_symbol = match self.find_occurrence(
+                    document,
+                    function_name_node.start_position().row,
+                    function_name_node.start_position().column,
+                ) {
+                    Ok(occurrence) => occurrence.symbol.clone(),
+                    Err(e) => {
+                        eprintln!("Error finding function occurrence: {}", e);
+                        continue;
+                    }
+                };
+
+                let param_name = &source[param_name_node.byte_range()];
+                let param_start = param_node.start_byte();
+                let param_end = param_node.end_byte();
+
+                if needs_window.contains(&function_symbol) {
+                    let underscore = if param_name.starts_with('_') { "_" } else { "" };
+                    self.edits
+                        .entry(PathBuf::from(relative_path))
+                        .or_default()
+                        .push(Edit {
+                            start: param_start,
+                            end: param_end,
+                            replacement: format!(
+                                "{}window: &mut Window, {}: &mut AppContext",
+                                underscore, param_name
+                            )
+                            .to_string(),
+                        });
+                } else {
+                    self.edits
+                        .entry(PathBuf::from(relative_path))
+                        .or_default()
+                        .push(Edit {
+                            start: param_start,
+                            end: param_end,
+                            replacement: format!("{}: &mut AppContext", param_name).to_string(),
+                        });
+                }
             }
         }
     }
@@ -398,147 +441,6 @@ impl Refactor {
             include_str!("./parameters.scm"),
         )
         .expect("Failed to create query")
-    }
-
-    pub fn process2(&mut self) -> Result<()> {
-        // for document in &self.index.documents {
-        //     let relative_path = document.relative_path.as_ref();
-        //     let file_path = self.index_folder.join(relative_path);
-        //     let mut file = File::open(&file_path)?;
-        //     let mut source = String::new();
-        //     file.read_to_string(&mut source)?;
-
-        //     let tree = self.parser.parse(&source, None).unwrap();
-        //     let root_node = tree.root_node();
-
-        //     // self.track_callers(&source, root_node, relative_path)?;
-        //     // self.process_functions(&source, root_node, relative_path);
-        //     // self.process_imports(&source);
-        // }
-
-        // self.trace_window_context_callers();
-
-        Ok(())
-    }
-
-    fn track_callers(
-        &mut self,
-        source: &str,
-        root_node: tree_sitter::Node,
-        relative_path: &str,
-    ) -> Result<()> {
-        let function_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.function_query())
-            .expect("Failed to create function query");
-        let call_query = Query::new(&tree_sitter_rust::LANGUAGE.into(), self.call_query())
-            .expect("Failed to create call query");
-
-        let mut function_query_cursor = QueryCursor::new();
-        let mut matches =
-            function_query_cursor.matches(&function_query, root_node, source.as_bytes());
-
-        while let Some(match_) = matches.next() {
-            let function_name_node = match_
-                .captures
-                .iter()
-                .find(|c| {
-                    c.index
-                        == function_query
-                            .capture_index_for_name("function_name")
-                            .unwrap()
-                })
-                .map(|c| c.node);
-
-            let function_body = match_
-                .captures
-                .iter()
-                .find(|c| {
-                    c.index
-                        == function_query
-                            .capture_index_for_name("function_body")
-                            .unwrap()
-                })
-                .map(|c| c.node);
-
-            if let (Some(name_node), Some(body_node)) = (function_name_node, function_body) {
-                let function_occurrence = match self.find_occurrence(
-                    relative_path,
-                    name_node.start_position().row,
-                    name_node.start_position().column,
-                    source,
-                ) {
-                    Ok(occurrence) => occurrence,
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        continue;
-                    }
-                };
-
-                let parent_symbol = function_occurrence.symbol.clone();
-
-                let mut call_cursor = QueryCursor::new();
-                let mut calls = call_cursor.matches(&call_query, body_node, source.as_bytes());
-
-                while let Some(call) = calls.next() {
-                    if let Some(method) = call
-                        .captures
-                        .iter()
-                        .find(|c| c.index == call_query.capture_index_for_name("method").unwrap())
-                    {
-                        match self.find_occurrence(
-                            relative_path,
-                            method.node.start_position().row,
-                            method.node.start_position().column,
-                            source,
-                        ) {
-                            Ok(method_occurrence) => {
-                                let method_symbol = method_occurrence.symbol.clone();
-                                self.caller_graph
-                                    .entry(method_symbol)
-                                    .or_insert_with(BTreeSet::new)
-                                    .insert(parent_symbol.clone());
-                            }
-                            Err(e) => eprintln!("{}", e),
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn trace_window_context_callers(&mut self) {
-        let mut to_process = Vec::new();
-        for (callee, callers) in &self.caller_graph {
-            if callee.contains("WindowContext#") {
-                for caller in callers {
-                    if self
-                        .transitive_window_context_callers
-                        .insert(caller.clone())
-                    {
-                        to_process.push(caller.clone());
-                    }
-                }
-            }
-        }
-
-        while let Some(caller) = to_process.pop() {
-            if let Some(callers) = self.caller_graph.get(&caller) {
-                for caller in callers {
-                    if self
-                        .transitive_window_context_callers
-                        .insert(caller.clone())
-                    {
-                        to_process.push(caller.clone());
-                    }
-                }
-            }
-        }
-
-        println!("!!!!!!!!!!!!!  Window context callers:");
-        for caller in &self.transitive_window_context_callers {
-            println!("  {}", caller);
-        }
     }
 
     fn process_functions(
@@ -826,21 +728,13 @@ impl Refactor {
         }
     }
 
-    fn find_occurrence(
+    fn find_occurrence<'a>(
         &self,
-        relative_path: &str,
+        document: &'a Document,
         line: usize,
         column: usize,
-        source: &str,
-    ) -> Result<&Occurrence> {
-        let document = self
-            .index
-            .documents
-            .binary_search_by(|doc| doc.relative_path.as_ref().cmp(relative_path))
-            .map_err(|_| anyhow::anyhow!("Document not found: {:?}", relative_path))?;
-        let doc = &self.index.documents[document];
-
-        let occurrence_index = doc
+    ) -> Result<&'a Occurrence> {
+        let occurrence_index = document
             .occurrences
             .binary_search_by(|occ| {
                 let start_row = occ.range.row;
@@ -856,12 +750,12 @@ impl Refactor {
                 anyhow::anyhow!("Occurrence not found at line {} column {}", line, column)
             })?;
 
-        Ok(&doc.occurrences[occurrence_index])
+        Ok(&document.occurrences[occurrence_index])
     }
 
     pub fn display_dry_run_results(&self) {
         for (path, edits) in &self.edits {
-            let mut file = File::open(path).expect("Failed to open file");
+            let mut file = File::open(&self.index_folder.join(path)).expect("Failed to open file");
             let mut source = String::new();
             file.read_to_string(&mut source)
                 .expect("Failed to read file");
@@ -889,16 +783,6 @@ impl Refactor {
             }
 
             println!("---\n");
-        }
-    }
-
-    fn display_callers(&self) {
-        println!("Callers:");
-        for (method, callers) in &self.caller_graph {
-            println!("  Method: {}", method);
-            for caller in callers {
-                println!("    Called by: {}", caller);
-            }
         }
     }
 
@@ -1183,8 +1067,7 @@ fn main() -> Result<()> {
     refactor.process()?;
 
     if args.dry {
-        refactor.display_callers();
-        // refactor.display_dry_run_results();
+        refactor.display_dry_run_results();
     } else {
         refactor.apply_edits()?;
     }
