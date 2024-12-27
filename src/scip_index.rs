@@ -6,11 +6,14 @@ use scip::types::{
 };
 use std::{
     collections::HashMap,
+    fmt,
     fs::File,
     io::Read,
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tree_sitter::Point;
 
 #[derive(Debug, Clone)]
 pub struct Index {
@@ -32,6 +35,12 @@ pub struct Document {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RelativePath(pub Arc<Path>);
 
+impl fmt::Display for RelativePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.display().fmt(f)
+    }
+}
+
 impl From<PathBuf> for RelativePath {
     fn from(path: PathBuf) -> RelativePath {
         RelativePath(path.into())
@@ -50,21 +59,21 @@ pub struct LocalSymbol(Arc<str>);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GlobalSymbol(pub Arc<str>);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalId {
+    pub relative_path: RelativePath,
+    pub symbol: LocalSymbol,
+}
+
 #[derive(Debug, Clone)]
 pub struct Occurrence {
-    pub range: Vec<i32>,
+    pub range: Range<Point>,
     pub symbol: Symbol,
     pub symbol_roles: i32,
     pub override_documentation: Vec<Arc<str>>,
     pub syntax_kind: SyntaxKind,
     pub diagnostics: Vec<Diagnostic>,
     pub enclosing_range: Vec<i32>,
-}
-
-impl Occurrence {
-    fn has_role(&self, role: SymbolRole) -> bool {
-        self.symbol_roles & (role as i32) != 0
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +84,7 @@ pub struct SymbolInformation {
     pub kind: Kind,
     pub display_name: Arc<str>,
     pub signature_documentation: Option<Arc<SignatureDocumentation>>,
-    pub enclosing_symbol: Arc<str>,
+    pub enclosing_symbol: Option<GlobalSymbol>,
 }
 
 // In SCIP this is represented as a Document, but it's cleaner to have a separate type.
@@ -157,40 +166,39 @@ impl Index {
 }
 
 impl Document {
-    pub fn find_occurrence(&self, point: &tree_sitter::Point) -> Result<&Occurrence> {
-        let line = point.row;
-        let column = point.column;
-
+    pub fn find_occurrence(&self, point: &Point) -> Result<&Occurrence> {
         let occurrence_index = self
             .occurrences
-            .binary_search_by(|occ| {
-                let start_line = occ.range[0] as usize;
-                let start_column = occ.range[1] as usize;
-
-                if start_line != line {
-                    start_line.cmp(&line)
-                } else {
-                    start_column.cmp(&column)
-                }
-            })
+            .binary_search_by_key(point, |occ| occ.range.start)
             .map_err(|_| {
                 anyhow::anyhow!(
                     "Occurrence not found at {:?}:{}:{}",
                     self.relative_path,
-                    line,
-                    column
+                    point.row,
+                    point.column,
                 )
             })?;
 
         Ok(&self.occurrences[occurrence_index])
     }
 
-    pub fn find_local_definition(&self, local: LocalSymbol) -> Result<&Occurrence> {
-        self.occurrences
-            .iter()
-            .find(|occ| {
-                occ.has_role(SymbolRole::Definition) && occ.symbol == Symbol::Local(local.clone())
-            })
+    pub fn find_local_definition_and_references(
+        &self,
+        local: &LocalSymbol,
+    ) -> Result<(&Occurrence, Vec<&Occurrence>)> {
+        let target = Symbol::Local(local.clone());
+        let mut definition = None;
+        let mut references = Vec::new();
+        for occ in self.occurrences.iter() {
+            if occ.symbol == target {
+                if occ.has_role(SymbolRole::Definition) {
+                    definition = Some(occ);
+                } else {
+                    references.push(occ);
+                }
+            }
+        }
+        definition
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Local definition for `{}` not found in {:?}",
@@ -198,6 +206,17 @@ impl Document {
                     self.relative_path
                 )
             })
+            .map(|definition| (definition, references))
+    }
+}
+
+impl Occurrence {
+    pub fn has_role(&self, role: SymbolRole) -> bool {
+        self.symbol_roles & (role as i32) != 0
+    }
+
+    pub fn range_string(&self, relative_path: &RelativePath) -> String {
+        format!("{}:{}-{}", relative_path, self.range.start, self.range.end)
     }
 }
 
@@ -220,14 +239,15 @@ impl From<scip::types::Index> for Index {
                 }
             }
 
+            let relative_path = RelativePath(Path::new(&document.relative_path).into());
+
             let mut occurrences = document
                 .occurrences
                 .into_iter()
                 .map(Occurrence::from)
                 .collect::<Vec<_>>();
-            occurrences.sort_by_key(|occ| (occ.range[0], occ.range[1]));
+            occurrences.sort_by_key(|occ| occ.range.start);
 
-            let relative_path = RelativePath(Path::new(&document.relative_path).into());
             documents.insert(
                 relative_path.clone(),
                 Document {
@@ -280,23 +300,30 @@ impl From<scip::types::ToolInfo> for ToolInfo {
 }
 
 impl From<scip::types::Occurrence> for Occurrence {
-    fn from(occurrence: scip::types::Occurrence) -> Self {
+    fn from(occ: scip::types::Occurrence) -> Self {
+        let range = match occ.range.len() {
+            3 => Range {
+                start: Point::new(occ.range[0] as usize, occ.range[1] as usize),
+                end: Point::new(occ.range[0] as usize, occ.range[2] as usize),
+            },
+            4 => Range {
+                start: Point::new(occ.range[0] as usize, occ.range[1] as usize),
+                end: Point::new(occ.range[2] as usize, occ.range[3] as usize),
+            },
+            l => panic!("SCIP Occurrence.range has {l} values when 3 or 4 are expected."),
+        };
         Occurrence {
-            range: occurrence.range,
-            symbol: occurrence.symbol.into(),
-            symbol_roles: occurrence.symbol_roles,
-            override_documentation: occurrence
+            range,
+            symbol: occ.symbol.into(),
+            symbol_roles: occ.symbol_roles,
+            override_documentation: occ
                 .override_documentation
                 .into_iter()
                 .map(Into::into)
                 .collect(),
-            syntax_kind: occurrence.syntax_kind.enum_value().unwrap(),
-            diagnostics: occurrence
-                .diagnostics
-                .into_iter()
-                .map(Diagnostic::from)
-                .collect(),
-            enclosing_range: occurrence.enclosing_range,
+            syntax_kind: occ.syntax_kind.enum_value().unwrap(),
+            diagnostics: occ.diagnostics.into_iter().map(Diagnostic::from).collect(),
+            enclosing_range: occ.enclosing_range,
         }
     }
 }
@@ -331,7 +358,17 @@ impl From<scip::types::SymbolInformation> for SymbolInformation {
                 .signature_documentation
                 .0
                 .map(|doc| Arc::new(SignatureDocumentation::from(*doc))),
-            enclosing_symbol: symbol_info.enclosing_symbol.into(),
+            enclosing_symbol: if symbol_info.enclosing_symbol.is_empty() {
+                None
+            } else {
+                match Symbol::from(symbol_info.enclosing_symbol) {
+                    Symbol::Global(symbol) => symbol.into(),
+                    Symbol::Local(_) => panic!(
+                        "Encountered local symbol in SymbolInformation.enclosing_symbol, \
+                    which is invalid."
+                    ),
+                }
+            },
         }
     }
 }

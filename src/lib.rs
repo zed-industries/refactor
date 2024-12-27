@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::LazyLock};
 
+pub mod file_editor;
+pub mod flow_analysis;
 pub mod query_calls;
 pub mod query_functions;
 pub mod query_imports;
