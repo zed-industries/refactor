@@ -34,6 +34,10 @@ struct Refactor {
     index_folder: PathBuf,
     caller_graph: BTreeMap<Arc<str>, BTreeSet<Arc<str>>>,
     edits: BTreeMap<Arc<str>, Vec<Edit>>,
+    function_type_parameters_query: Query,
+    functions_query: Query,
+    imports_query: Query,
+    parameters_query: Query,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +140,10 @@ impl Refactor {
             index_folder,
             caller_graph: BTreeMap::new(),
             edits: BTreeMap::new(),
+            function_type_parameters_query: Self::parse_function_type_params_query(),
+            functions_query: Self::parse_functions_query(),
+            imports_query: Self::parse_imports_query(),
+            parameters_query: Self::parse_parameters_query(),
         })
     }
 
@@ -210,7 +218,7 @@ impl Refactor {
         let tree = self.parser.parse(&source, None).unwrap();
         let root_node = tree.root_node();
 
-        let query = Self::functions_query();
+        let query = &self.functions_query;
         let function_item_name_ix = query.capture_index_for_name("function_item.name").unwrap();
         let function_item_ix = query.capture_index_for_name("function_item").unwrap();
         let mut cursor = QueryCursor::new();
@@ -369,7 +377,7 @@ impl Refactor {
         relative_path: &Arc<str>,
         needs_window: &BTreeSet<Arc<str>>,
     ) {
-        let query = Self::parameters_query();
+        let query = &self.parameters_query;
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root_node, source.as_bytes());
         let param_ix = query.capture_index_for_name("parameter").unwrap();
@@ -439,7 +447,7 @@ impl Refactor {
         root_node: Node,
         relative_path: &Arc<str>,
     ) {
-        let query = Self::function_type_params_query();
+        let query = &self.function_type_parameters_query;
         let param_ix = query.capture_index_for_name("parameter").unwrap();
         let param_type_ix = query.capture_index_for_name("parameter.type").unwrap();
 
@@ -470,9 +478,8 @@ impl Refactor {
     }
 
     fn stage_import_edits(&mut self, source: &str, root_node: Node, relative_path: &Arc<str>) {
-        let import_query = self.imports_query();
         let mut query_cursor = QueryCursor::new();
-        let mut matches = query_cursor.matches(&import_query, root_node, source.as_bytes());
+        let mut matches = query_cursor.matches(&self.imports_query, root_node, source.as_bytes());
 
         let mut window_context_import: Option<(usize, usize)> = None;
         let mut window_imported = false;
@@ -484,7 +491,7 @@ impl Refactor {
             let mut import_end = 0;
 
             for capture in match_.captures {
-                match import_query.capture_names()[capture.index as usize] {
+                match self.imports_query.capture_names()[capture.index as usize] {
                     "import_name" => {
                         import_name = &source[capture.node.byte_range()];
                         import_start = capture.node.start_byte();
@@ -534,7 +541,7 @@ impl Refactor {
         Ok(source)
     }
 
-    fn functions_query() -> Query {
+    fn parse_functions_query() -> Query {
         Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
             include_str!("./functions.scm"),
@@ -542,7 +549,7 @@ impl Refactor {
         .expect("Failed to create query")
     }
 
-    fn parameters_query() -> Query {
+    fn parse_parameters_query() -> Query {
         Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
             include_str!("./parameters.scm"),
@@ -550,7 +557,7 @@ impl Refactor {
         .expect("Failed to create query")
     }
 
-    fn function_type_params_query() -> Query {
+    fn parse_function_type_params_query() -> Query {
         Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
             include_str!("./function_type_parameters.scm"),
@@ -558,7 +565,7 @@ impl Refactor {
         .expect("Failed to create query")
     }
 
-    fn imports_query(&self) -> Query {
+    fn parse_imports_query() -> Query {
         Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
             include_str!("./imports.scm"),
