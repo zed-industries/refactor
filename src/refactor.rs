@@ -11,6 +11,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
@@ -784,6 +785,8 @@ impl From<scip::types::Diagnostic> for Diagnostic {
 }
 
 fn main() -> Result<()> {
+    let start_time = SystemTime::now();
+
     let args = Args::parse();
 
     let path = std::fs::canonicalize(&args.path)?;
@@ -799,7 +802,10 @@ fn main() -> Result<()> {
         refactor.apply_edits()?;
     }
 
-    // TODO: Implement the refactoring logic using the Refactor struct
+    println!(
+        "Elapsed time: {:?}",
+        SystemTime::now().duration_since(start_time)
+    );
 
     Ok(())
 }
