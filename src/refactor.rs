@@ -7,6 +7,7 @@ use scip::types::{
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    f64::consts::LOG2_E,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -177,117 +178,202 @@ impl Refactor {
     }
 
     pub fn process(&mut self) -> Result<()> {
-        // Walk over every document in the index
-        // Parse every function definition in the document
-        // Find every method symbol occurence with range[0]
+        self.build_caller_graph()?;
+        let mut window_context_methods = self.find_window_context_methods()?;
+        let need_window = self.find_transitive_callers(&mut window_context_methods);
+        self.prepare_edits(&need_window)?;
 
-        let mut capture_count = std::collections::HashMap::new();
+        println!("Transitive callers:");
+        for caller in &need_window {
+            println!("  {}", caller);
+        }
 
+        Ok(())
+    }
+
+    fn build_caller_graph(&mut self) -> Result<()> {
         for (index, document) in self.index.documents.iter().enumerate() {
             let relative_path = document.relative_path.as_ref();
             let source = self.load_relative_path(relative_path)?;
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            let query = Self::first_pass_query();
+            let query = Self::functions_query();
             let function_item_name_ix = query.capture_index_for_name("function_item.name").unwrap();
+            let function_item_ix = query.capture_index_for_name("function_item").unwrap();
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&query, root_node, source.as_bytes());
 
             while let Some(match_) = matches.next() {
-                for capture in match_.captures {
-                    if query.capture_names()[capture.index as usize] == "function_item.name" {
+                let function_item = match_
+                    .nodes_for_capture_index(function_item_ix)
+                    .next()
+                    .unwrap();
+                let function_name = match_
+                    .nodes_for_capture_index(function_item_name_ix)
+                    .next()
+                    .unwrap();
+
+                let definition_symbol = match document.occurrences.binary_search_by(|occ| {
+                    occ.range.row.cmp(&function_name.start_position().row).then(
+                        occ.range
+                            .start_column
+                            .cmp(&function_name.start_position().column),
+                    )
+                }) {
+                    Ok(index) => &document.occurrences[index].symbol,
+                    Err(_) => {
+                        // We may find definitions syntactically that aren't in the current SCIP index.
                         continue;
                     }
+                };
 
-                    if query.capture_names()[capture.index as usize] == "function_item" {
-                        for capture in match_.captures {
-                            if capture.index == function_item_name_ix {
-                                let _function_name = &source[capture.node.byte_range()];
-                                // *type_count.entry("function_item".to_string()).or_insert(0) += 1;
-                            }
-                        }
-                        continue;
-                    }
+                let function_item_range = function_item.range();
+                let child_occurences_start = match document.occurrences.binary_search_by(|occ| {
+                    occ.range
+                        .row
+                        .cmp(&function_item_range.start_point.row)
+                        .then(
+                            occ.range
+                                .start_column
+                                .cmp(&function_item_range.start_point.column),
+                        )
+                }) {
+                    Ok(index) => index,
+                    Err(index) => index,
+                };
+                let child_occurences_end = match document.occurrences.binary_search_by(|occ| {
+                    occ.range.row.cmp(&function_item_range.end_point.row).then(
+                        occ.range
+                            .end_column
+                            .cmp(&function_item_range.end_point.column),
+                    )
+                }) {
+                    Ok(index) => index + 1,
+                    Err(index) => index,
+                };
 
-                    let param_type = &source[capture.node.byte_range()];
-                    if param_type != "WindowContext" {
-                        continue;
-                    }
-
-                    let capture_name = query.capture_names()[capture.index as usize];
-                    if let Some(count) = capture_count.get_mut(capture_name) {
-                        *count += 1;
-                    } else {
-                        capture_count.insert(capture_name.to_string(), 1);
-                    }
-
-                    let start_pos = capture.node.start_position();
-                    let line = source.lines().nth(start_pos.row).unwrap_or("");
-                    println!("Capture: {}", line);
-
-                    // match query.capture_names()[capture.index as usize] {
-                    //     "function.param.type" => {
-                    //         *type_count.entry("function.param.type").or_insert(0) += 1;
-                    //     }
-                    //     "function_sig.param.type" => {
-                    //         *type_count.entry("function_sig.param.type").or_insert(0) += 1;
-                    //     }
-                    //     "closure.param.type" => {
-                    //         *type_count.entry("closure.param.type").or_insert(0) += 1;
-                    //     }
-                    //     "fn_pointer.param.type" => {
-                    //         *type_count.entry("fn_pointer.param.type").or_insert(0) += 1;
-                    //     }
-                    //     "generic_bound.type" => {
-                    //         *type_count.entry("generic_bound.type").or_insert(0) += 1;
-                    //     }
-                    //     "where_bound.type" => {
-                    //         *type_count.entry("where_bound.type").or_insert(0) += 1;
-                    //     }
-                    //     "associated_type.type" => {
-                    //         *type_count.entry("associated_type.type").or_insert(0) += 1;
-                    //     }
-                    //     "ref.param.type" => {
-                    //         *type_count.entry("ref.param.type").or_insert(0) += 1;
-                    //     }
-                    //     "ptr.param.type" => {
-                    //         *type_count.entry("ptr.param.type").or_insert(0) += 1;
-                    //     }
-                    //     "tuple_struct.param.type" => {
-                    //         *type_count.entry("tuple_struct.param.type").or_insert(0) += 1;
-                    //     }
-                    //     _ => {
-                    //         println!(
-                    //             "Unhandled type: {}",
-                    //             query.capture_names()[capture.index as usize]
-                    //         );
-                    //         *type_count.entry("unhandled").or_insert(0) += 1;
-                    //     }
-                    // }
+                for child_occurrence in document.occurrences
+                    [child_occurences_start..child_occurences_end]
+                    .iter()
+                    .filter(|occ| occ.symbol_roles == 0 && occ.symbol.ends_with("()."))
+                {
+                    self.caller_graph
+                        .entry(child_occurrence.symbol.clone())
+                        .or_insert_with(BTreeSet::new)
+                        .insert(definition_symbol.clone());
                 }
             }
 
-            println!(
-                "\rProcessed {} of {} documents ({:.1}%)",
+            let progress = (index + 1) as f32 / self.index.documents.len() as f32;
+            print!(
+                "\r\u{1b}[KBuilding caller graph – {}/{} documents ({:.1}%)",
                 index + 1,
                 self.index.documents.len(),
-                (index + 1) as f32 / self.index.documents.len() as f32 * 100.0
+                progress * 100.0
             );
             std::io::stdout().flush().unwrap();
-
-            // self.track_callers(&source, root_node, relative_path)?;
-            // self.process_functions(&source, root_node, relative_path);
-            // self.process_imports(&source);
         }
-
-        for (type_name, count) in capture_count.iter() {
-            println!("{}: {}", type_name, count);
-        }
-
-        // self.trace_window_context_callers();
+        println!("");
 
         Ok(())
+    }
+
+    fn find_window_context_methods(&self) -> Result<BTreeSet<Arc<str>>> {
+        let window_rs_path = "crates/gpui/src/window.rs";
+        let document_index = self
+            .index
+            .documents
+            .binary_search_by(|doc| {
+                Path::new(doc.relative_path.as_ref()).cmp(Path::new(window_rs_path))
+            })
+            .map_err(|_| anyhow::anyhow!("Document not found: {:?}", window_rs_path))?;
+
+        let document = &self.index.documents[document_index];
+
+        let mut window_context_methods = BTreeSet::new();
+
+        for symbol in &document.symbols {
+            if symbol.symbol.contains("/WindowContext") {
+                if let Kind::Method = symbol.kind {
+                    let hash_count = symbol.symbol.matches('#').count();
+                    if hash_count == 1 {
+                        window_context_methods.insert(symbol.symbol.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(window_context_methods)
+    }
+
+    fn find_transitive_callers(&self, target_methods: &BTreeSet<Arc<str>>) -> BTreeSet<Arc<str>> {
+        println!(
+            "Finding transitive callers for {} methods",
+            target_methods.len()
+        );
+
+        let mut to_visit: Vec<Arc<str>> = target_methods.iter().cloned().collect();
+        let mut visited = BTreeSet::new();
+
+        while let Some(method) = to_visit.pop() {
+            if !visited.insert(method.clone()) {
+                continue;
+            }
+
+            if let Some(callers) = self.caller_graph.get(&method) {
+                for caller in callers {
+                    if !visited.contains(caller) {
+                        to_visit.push(caller.clone());
+                    }
+                }
+            }
+        }
+
+        visited
+    }
+
+    fn prepare_edits(&mut self, need_window: &BTreeSet<Arc<str>>) -> Result<Vec<Edit>> {
+        let mut edits = Vec::new();
+
+        let documents = std::mem::take(&mut self.index.documents);
+        for document in &documents {
+            let relative_path = document.relative_path.as_ref();
+            let source = self.load_relative_path(relative_path)?;
+            let tree = self.parser.parse(&source, None).unwrap();
+            let root_node = tree.root_node();
+
+            self.process_params(document, &source, root_node, relative_path, need_window);
+        }
+        self.index.documents = documents;
+
+        Ok(edits)
+    }
+
+    fn process_params(
+        &mut self,
+        document: &Document,
+        source: &str,
+        root_node: tree_sitter::Node,
+        relative_path: &str,
+        needs_window: &BTreeSet<Arc<str>>,
+    ) {
+        let query = Self::parameters_query();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root_node, source.as_bytes());
+
+        while let Some(match_) = matches.next() {
+            for capture in match_.captures {
+                let param_type = &source[capture.node.byte_range()];
+                if param_type != "WindowContext" {
+                    continue;
+                }
+
+                let start_pos = capture.node.start_position();
+                let line = source.lines().nth(start_pos.row).unwrap_or("");
+                println!("Capture: {}", line);
+            }
+        }
     }
 
     fn load_relative_path(&self, relative_path: &str) -> Result<String> {
@@ -298,44 +384,18 @@ impl Refactor {
         Ok(source)
     }
 
-    fn first_pass_query() -> Query {
+    fn functions_query() -> Query {
         Query::new(
             &tree_sitter_rust::LANGUAGE.into(),
-            r#"
-            ; Capture entire function items and their names in one pattern
-            (function_item
-              name: (identifier) @function_item.name
-              parameters: (parameters
-                (parameter
-                  type: [
-                    (reference_type
-                      type: [
-                        (type_identifier) @function.param.type
-                        (scoped_type_identifier
-                          name: (type_identifier) @function.param.type
-                        )
-                      ]
-                    )
-                  ]
-                )
-              )
-            ) @function_item
+            include_str!("./functions.scm"),
+        )
+        .expect("Failed to create query")
+    }
 
-            ; Function signature parameters
-            (function_signature_item
-              parameters: (parameters
-                (parameter
-                  type: (reference_type
-                    type: [(type_identifier) @function_sig.param.type (scoped_type_identifier name: (type_identifier) @function_sig.param.type)]))))
-
-            ; Closure parameters
-            (closure_expression
-                parameters: (closure_parameters
-                (parameter
-                    type: (reference_type
-                    type: [(type_identifier) @closure.param.type (scoped_type_identifier name: (type_identifier) @closure.param.type)]))))
-
-            "#,
+    fn parameters_query() -> Query {
+        Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            include_str!("./parameters.scm"),
         )
         .expect("Failed to create query")
     }
