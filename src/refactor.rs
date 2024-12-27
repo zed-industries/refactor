@@ -181,7 +181,7 @@ impl Refactor {
         // Parse every function definition in the document
         // Find every method symbol occurence with range[0]
 
-        let mut type_count = std::collections::HashMap::new();
+        let mut capture_count = std::collections::HashMap::new();
 
         for (index, document) in self.index.documents.iter().enumerate() {
             let relative_path = document.relative_path.as_ref();
@@ -196,86 +196,75 @@ impl Refactor {
 
             while let Some(match_) = matches.next() {
                 for capture in match_.captures {
-                    println!("Captured node: {:?}", capture.node);
-
-                    match query.capture_names()[capture.index as usize] {
-                        "function_item" => {
-                            for capture in match_.captures {
-                                if capture.index == function_item_name_ix {
-                                    let _function_name = &source[capture.node.byte_range()];
-                                    *type_count.entry("function_item").or_insert(0) += 1;
-                                }
-                            }
-                        }
-                        "function_item.name" => { /* No-Op */ }
-                        "function.param.type" => {
-                            let param_type = &source[capture.node.byte_range()];
-                            if param_type == "WindowContext" {
-                                *type_count.entry("function.param.type").or_insert(0) += 1;
-                            }
-                        }
-                        "function_sig.param.type" => {
-                            let sig_param_type = &source[capture.node.byte_range()];
-                            if sig_param_type == "WindowContext" {
-                                *type_count.entry("function_sig.param.type").or_insert(0) += 1;
-                            }
-                        }
-                        "closure.param.type" => {
-                            let closure_param_type = &source[capture.node.byte_range()];
-                            if closure_param_type == "WindowContext" {
-                                *type_count.entry("closure.param.type").or_insert(0) += 1;
-                            }
-                        }
-                        "fn_pointer.param.type" => {
-                            let fn_pointer_param_type = &source[capture.node.byte_range()];
-                            if fn_pointer_param_type == "WindowContext" {
-                                *type_count.entry("fn_pointer.param.type").or_insert(0) += 1;
-                            }
-                        }
-                        "generic_bound.type" => {
-                            let generic_bound_type = &source[capture.node.byte_range()];
-                            if generic_bound_type == "WindowContext" {
-                                *type_count.entry("generic_bound.type").or_insert(0) += 1;
-                            }
-                        }
-                        "where_bound.type" => {
-                            let where_bound_type = &source[capture.node.byte_range()];
-                            if where_bound_type == "WindowContext" {
-                                *type_count.entry("where_bound.type").or_insert(0) += 1;
-                            }
-                        }
-                        "associated_type.type" => {
-                            let associated_type = &source[capture.node.byte_range()];
-                            if associated_type == "WindowContext" {
-                                *type_count.entry("associated_type.type").or_insert(0) += 1;
-                            }
-                        }
-                        "ref.param.type" => {
-                            let ref_param_type = &source[capture.node.byte_range()];
-                            if ref_param_type == "WindowContext" {
-                                *type_count.entry("ref.param.type").or_insert(0) += 1;
-                            }
-                        }
-                        "ptr.param.type" => {
-                            let ptr_param_type = &source[capture.node.byte_range()];
-                            if ptr_param_type == "WindowContext" {
-                                *type_count.entry("ptr.param.type").or_insert(0) += 1;
-                            }
-                        }
-                        "tuple_struct.param.type" => {
-                            let tuple_struct_param_type = &source[capture.node.byte_range()];
-                            if tuple_struct_param_type == "WindowContext" {
-                                *type_count.entry("tuple_struct.param.type").or_insert(0) += 1;
-                            }
-                        }
-                        _ => {
-                            println!(
-                                "Unhandled type: {}",
-                                query.capture_names()[capture.index as usize]
-                            );
-                            *type_count.entry("unhandled").or_insert(0) += 1;
-                        }
+                    if query.capture_names()[capture.index as usize] == "function_item.name" {
+                        continue;
                     }
+
+                    if query.capture_names()[capture.index as usize] == "function_item" {
+                        for capture in match_.captures {
+                            if capture.index == function_item_name_ix {
+                                let _function_name = &source[capture.node.byte_range()];
+                                // *type_count.entry("function_item".to_string()).or_insert(0) += 1;
+                            }
+                        }
+                        continue;
+                    }
+
+                    let param_type = &source[capture.node.byte_range()];
+                    if param_type != "WindowContext" {
+                        continue;
+                    }
+
+                    let capture_name = query.capture_names()[capture.index as usize];
+                    if let Some(count) = capture_count.get_mut(capture_name) {
+                        *count += 1;
+                    } else {
+                        capture_count.insert(capture_name.to_string(), 1);
+                    }
+
+                    let start_pos = capture.node.start_position();
+                    let line = source.lines().nth(start_pos.row).unwrap_or("");
+                    println!("Capture: {}", line);
+
+                    // match query.capture_names()[capture.index as usize] {
+                    //     "function.param.type" => {
+                    //         *type_count.entry("function.param.type").or_insert(0) += 1;
+                    //     }
+                    //     "function_sig.param.type" => {
+                    //         *type_count.entry("function_sig.param.type").or_insert(0) += 1;
+                    //     }
+                    //     "closure.param.type" => {
+                    //         *type_count.entry("closure.param.type").or_insert(0) += 1;
+                    //     }
+                    //     "fn_pointer.param.type" => {
+                    //         *type_count.entry("fn_pointer.param.type").or_insert(0) += 1;
+                    //     }
+                    //     "generic_bound.type" => {
+                    //         *type_count.entry("generic_bound.type").or_insert(0) += 1;
+                    //     }
+                    //     "where_bound.type" => {
+                    //         *type_count.entry("where_bound.type").or_insert(0) += 1;
+                    //     }
+                    //     "associated_type.type" => {
+                    //         *type_count.entry("associated_type.type").or_insert(0) += 1;
+                    //     }
+                    //     "ref.param.type" => {
+                    //         *type_count.entry("ref.param.type").or_insert(0) += 1;
+                    //     }
+                    //     "ptr.param.type" => {
+                    //         *type_count.entry("ptr.param.type").or_insert(0) += 1;
+                    //     }
+                    //     "tuple_struct.param.type" => {
+                    //         *type_count.entry("tuple_struct.param.type").or_insert(0) += 1;
+                    //     }
+                    //     _ => {
+                    //         println!(
+                    //             "Unhandled type: {}",
+                    //             query.capture_names()[capture.index as usize]
+                    //         );
+                    //         *type_count.entry("unhandled").or_insert(0) += 1;
+                    //     }
+                    // }
                 }
             }
 
@@ -292,7 +281,7 @@ impl Refactor {
             // self.process_imports(&source);
         }
 
-        for (type_name, count) in type_count.iter() {
+        for (type_name, count) in capture_count.iter() {
             println!("{}: {}", type_name, count);
         }
 
@@ -318,19 +307,22 @@ impl Refactor {
               name: (identifier) @function_item.name
               parameters: (parameters
                 (parameter
-                  type: [(type_identifier) (scoped_type_identifier)] @function.param.type))) @function_item
+                  type: [(reference_type
+                    type: [(type_identifier) @function.param.type (scoped_type_identifier name: (type_identifier) @function.param.type)])
+                        (type_identifier) @function.param.type
+                        (scoped_type_identifier name: (type_identifier) @function.param.type)]))) @function_item
 
             ; Function signature parameters
             (function_signature_item
               parameters: (parameters
                 (parameter
-                  type: [(type_identifier) (scoped_type_identifier)] @function_sig.param.type)))
+                  type: [(type_identifier) @function_sig.param.type (scoped_type_identifier name: (type_identifier) @function_sig.param.type)])))
 
             ; Closure parameters
             (closure_expression
               parameters: (closure_parameters
                 (parameter
-                  type: [(type_identifier) (scoped_type_identifier)] @closure.param.type)))
+                  type: [(type_identifier) @closure.param.type (scoped_type_identifier name: (type_identifier) @closure.param.type)])))
 
             ; Function pointer types in parameters
             (parameter
@@ -345,29 +337,20 @@ impl Refactor {
                   bounds: (trait_bounds
                     (type_identifier) @generic_bound.type))))
 
-            ; Trait bounds in where clauses
-            (where_predicate
-              bounds: (trait_bounds
-                (type_identifier) @where_bound.type))
-
-            ; Associated types in trait bounds
-            (type_binding
-              type: [(type_identifier) (scoped_type_identifier)] @associated_type.type)
-
             ; Reference types in parameters
             (parameter
               type: (reference_type
-                type: [(type_identifier) (scoped_type_identifier)] @ref.param.type))
+                type: [(type_identifier) @ref.param.type (scoped_type_identifier name: (type_identifier) @ref.param.type)]))
 
             ; Pointer types in parameters
             (parameter
               type: (pointer_type
-                type: [(type_identifier) (scoped_type_identifier)] @ptr.param.type))
+                type: [(type_identifier) @ptr.param.type (scoped_type_identifier name: (type_identifier) @ptr.param.type)]))
 
             ; Tuple struct patterns in parameters
             (parameter
               pattern: (tuple_struct_pattern
-                type: [(identifier) (scoped_identifier)] @tuple_struct.param.type))
+                type: [(identifier) @tuple_struct.param.type (scoped_identifier name: (identifier) @tuple_struct.param.type)]))
             "#,
         )
         .expect("Failed to create query")
