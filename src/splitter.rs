@@ -2,7 +2,13 @@ use anyhow::{anyhow, Context as _, Result};
 use clap::Parser as ClapParser;
 use itertools::Itertools;
 use refactor::{file_editor::*, scip_index::*};
-use std::{io::Write, iter, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    io::Write,
+    iter,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
@@ -313,7 +319,8 @@ impl Refactor {
                     .clone();
 
                 let method_symbol_text = method_symbol.text();
-                let is_window_context = method_symbol_text.contains("WindowContext");
+                let is_window_context = method_symbol_text.contains("WindowContext")
+                    && !method_symbol_text.contains("[Context]");
                 let is_app_context = method_symbol_text.contains("AppContext");
                 if is_window_context && is_app_context {
                     return Err(anyhow!(
@@ -397,11 +404,7 @@ impl Refactor {
     fn all_window_context_locals(&self) -> Vec<LocalInfo> {
         let mut results: Vec<LocalInfo> = Vec::new();
         for document in self.index.documents.values() {
-            if document.relative_path.0
-                == PathBuf::from_str("crates/gpui/src/window.rs")
-                    .unwrap()
-                    .into()
-            {
+            if document.relative_path.0.as_ref() == Path::new("crates/gpui/src/window.rs") {
                 continue;
             }
             for (symbol, symbol_info) in document.locals.iter() {
