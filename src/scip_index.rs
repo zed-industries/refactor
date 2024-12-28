@@ -53,6 +53,15 @@ pub enum Symbol {
     Global(GlobalSymbol),
 }
 
+impl Symbol {
+    pub fn text(&self) -> &Arc<str> {
+        match self {
+            Symbol::Local(LocalSymbol(text)) => text,
+            Symbol::Global(GlobalSymbol(text)) => text,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocalSymbol(Arc<str>);
 
@@ -166,6 +175,17 @@ impl Index {
 }
 
 impl Document {
+    pub fn lookup_symbol<'s, 'i: 's>(
+        &'s self,
+        symbol: &Symbol,
+        index: &'i Index,
+    ) -> Option<&'s SymbolInformation> {
+        match symbol {
+            Symbol::Global(global) => index.symbols.get(global),
+            Symbol::Local(local) => self.locals.get(local),
+        }
+    }
+
     pub fn find_occurrence(&self, point: &Point) -> Result<&Occurrence> {
         let occurrence_index = self
             .occurrences
