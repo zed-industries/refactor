@@ -44,29 +44,29 @@ impl LsifIndex {
             documents: BTreeMap::new(),
         };
 
-        // this.populate_documents()?;
+        this.populate_documents()?;
 
         Ok(this)
     }
 
-    // fn populate_documents(&mut self) -> Result<()> {
-    //     let rtxn = self.graph.env.read_txn()?;
-    //     let total = self.graph.vertices.len(&rtxn)?;
-    //     for (i, item) in self.graph.vertices.iter(&rtxn)?.enumerate() {
-    //         let (id, vertex) = item?;
-    //         if let Vertex::Document(document) = vertex {
-    //             self.documents.insert(
-    //                 id,
-    //                 Document {
-    //                     path: Arc::from(PathBuf::from(document.uri.path().as_str())),
-    //                 },
-    //             );
-    //         }
-    //         print_progress(i + 1, total as usize, "Populating documents");
-    //     }
-    //     println!();
-    //     Ok(())
-    // }
+    fn populate_documents(&mut self) -> Result<()> {
+        let rtxn = self.graph.env.read_txn()?;
+        let total = self.graph.vertices.len(&rtxn)?;
+        for (i, item) in self.graph.vertices.iter(&rtxn)?.enumerate() {
+            let (id, vertex) = item?;
+            if let Vertex::Document(document) = vertex {
+                self.documents.insert(
+                    id,
+                    Document {
+                        path: Arc::from(PathBuf::from(document.uri.path().as_str())),
+                    },
+                );
+            }
+            print_progress(i + 1, total as usize, "Populating documents");
+        }
+        println!();
+        Ok(())
+    }
 }
 
 impl LsifGraph {
@@ -83,6 +83,10 @@ impl LsifGraph {
         let mut wtxn = env.write_txn()?;
         let vertices = env.create_database(&mut wtxn, Some("vertices"))?;
         let edges = env.create_database(&mut wtxn, Some("edges"))?;
+        let timestamp: heed::Database<
+            I32<BigEndian>,
+            heed::types::SerdeJson<std::time::SystemTime>,
+        > = env.create_database(&mut wtxn, Some("timestamp"))?;
         wtxn.commit()?;
 
         let graph = LsifGraph {
@@ -90,6 +94,26 @@ impl LsifGraph {
             vertices,
             edges,
         };
+
+        let lsif_modified = path.metadata()?.modified()?;
+        let db_timestamp = timestamp.get(&graph.env.read_txn()?, &0)?;
+
+        if let Some(db_time) = db_timestamp {
+            if db_time >= lsif_modified {
+                println!("Database is up to date. Skipping population.");
+                return Ok(graph);
+            }
+        }
+
+        if db_timestamp.is_some() {
+            println!("Database is outdated. Clearing and repopulating...");
+            let mut wtxn = graph.env.write_txn()?;
+            graph.vertices.clear(&mut wtxn)?;
+            graph.edges.clear(&mut wtxn)?;
+            wtxn.commit()?;
+        } else {
+            println!("Populating database for the first time...");
+        }
 
         let line_count = BufReader::new(File::open(path)?).lines().count();
         let file = File::open(path)?;
@@ -115,6 +139,7 @@ impl LsifGraph {
         }
         println!();
 
+        timestamp.put(&mut wtxn, &0, &lsif_modified)?;
         wtxn.commit()?;
 
         Ok(graph)
