@@ -291,7 +291,7 @@ impl Refactor {
             "type_identifier",
         ];
 
-        self.find_sparse_path_matches(&node, &pattern, source, |this, path| {
+        self.find_sparse_path_matches(node, &pattern, source, |this, path| {
             let node = path.last().unwrap();
             if node.kind() == "type_identifier" && &source[node.byte_range()] == "WindowContext" {
                 let function_item = path.first().unwrap().child_by_field_name("name").unwrap();
@@ -307,7 +307,7 @@ impl Refactor {
 
     fn find_sparse_path_matches<F>(
         &mut self,
-        node: &Node,
+        node: Node,
         pattern: &[&str],
         source: &str,
         mut callback: F,
@@ -338,6 +338,7 @@ impl Refactor {
                 if next_index == pattern.len() {
                     callback(this, current_path);
                     current_path.pop();
+                    return;
                 }
             }
 
@@ -438,9 +439,10 @@ impl Refactor {
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            self.stage_param_edits(document, &source, root_node, relative_path, need_window);
-            self.stage_function_type_edits(&source, root_node, relative_path);
-            self.stage_import_edits(&source, root_node, relative_path);
+            // self.stage_param_edits(document, &source, root_node, relative_path, need_window);
+            // self.stage_function_type_edits(&source, root_node, relative_path);
+            self.stage_closure_edits(document, &source, root_node, relative_path);
+            // self.stage_import_edits(&source, root_node, relative_path);
 
             let progress = (index + 1) as f32 / total_documents as f32;
             print!(
@@ -547,6 +549,59 @@ impl Refactor {
                 }
             }
         }
+    }
+
+    fn stage_closure_edits(
+        &mut self,
+        document: &Document,
+        source: &str,
+        node: Node,
+        relative_path: &Arc<str>,
+    ) {
+        self.find_sparse_path_matches(
+            node,
+            &["call_expression", "arguments", "closure_expression"],
+            source,
+            |this, path| {
+                let function = path[0].child_by_field_name("function").unwrap();
+                let fn_occurrence = match function.kind() {
+                    "field_expression" => {
+                        let field = function.child_by_field_name("field").unwrap();
+                        this.find_occurrence(document, field.start_position()).ok()
+                    }
+                    "generic_function" | "identifier" => this
+                        .find_occurrence(document, function.start_position())
+                        .ok(),
+                    "scoped_identifier" => {
+                        let name = function.child_by_field_name("name").unwrap();
+                        this.find_occurrence(document, name.start_position()).ok()
+                    }
+                    _ => None,
+                };
+
+                if let Some(fn_occurrence) = fn_occurrence {
+                    if this
+                        .fns_taking_window_context_fns
+                        .contains(&fn_occurrence.symbol)
+                    {
+                        println!(
+                            "Found closure with WindowContext fn: {:?}",
+                            fn_occurrence.symbol
+                        );
+                    }
+                } else {
+                    println!("Missing occurrence for function: {:?}", function.kind());
+                    let function_text = function.utf8_text(source.as_bytes()).unwrap();
+                    let line_number = source[..function.start_byte()].lines().count() + 1;
+                    println!(
+                        "File: {:?}, Line: {}, Function: {}",
+                        relative_path,
+                        line_number,
+                        function_text.lines().next().unwrap_or("")
+                    );
+                }
+            },
+        );
     }
 
     fn stage_import_edits(&mut self, source: &str, root_node: Node, relative_path: &Arc<str>) {
