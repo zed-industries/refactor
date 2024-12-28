@@ -87,6 +87,8 @@ impl Refactor {
             let mut window_name = match cx_name.to_string().as_str() {
                 "cx" => "window",
                 "_cx" => "_window",
+                "cx_a" => "window_a",
+                "cx_b" => "window_b",
                 name => {
                     file.record_error(
                         local_info.definition.range.start.row,
@@ -273,7 +275,7 @@ impl Refactor {
                         );
                         let parameter =
                             parameters.named_child(parameter_index).with_context(|| {
-                                format!("Getting argument {parameter_index} of {signature}")
+                                format!("Getting parameter {parameter_index} of {signature}")
                             })?;
                         let parameter_text = &signature[parameter.byte_range()];
                         let is_window_context = parameter_text.contains("WindowContext");
@@ -471,6 +473,7 @@ impl Refactor {
                 let replacement = match file.node_text(parent1) {
                     "_: &WindowContext" => "_: &Window, _: &AppContext",
                     "_: &mut WindowContext" => "_: &mut Window, _: &mut AppContext",
+                    "_: &mut WindowContext<'_>" => "_: &mut Window, _: &mut AppContext",
                     parameter_text => {
                         return Err(anyhow!("Unexpected _: parameter {parameter_text}"));
                     }
@@ -555,9 +558,10 @@ fn call_expression_function_identifier(call_expression: Node) -> Result<Node> {
             "field_expression" => node.child_by_field_name("field").unwrap(),
             "scoped_identifier" => node.child_by_field_name("name").unwrap(),
             "generic_function" => node.child_by_field_name("function").unwrap(),
+            "parenthesized_expression" => node.named_child(0).unwrap(),
             name => {
                 return Err(anyhow!(
-                    "Unexpected node type in call_expression_method: {name}"
+                    "Unexpected node type in call_expression_function_identifier: {name}"
                 ))
             }
         };
