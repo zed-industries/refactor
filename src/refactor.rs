@@ -296,9 +296,8 @@ impl Refactor {
             let node = path.last().unwrap();
             if node.kind() == "type_identifier" && &source[node.byte_range()] == "WindowContext" {
                 let function_item = path.first().unwrap().child_by_field_name("name").unwrap();
-                let position = function_item.start_position();
                 if let Ok(occurrence) =
-                    this.find_occurrence(document, position.row, position.column)
+                    this.find_occurrence(document, function_item.start_position())
                 {
                     this.fns_taking_window_context_fns
                         .insert(occurrence.symbol.clone());
