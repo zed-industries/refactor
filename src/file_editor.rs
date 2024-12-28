@@ -1,12 +1,12 @@
 use crate::scip_index::RelativePath;
 use anyhow::{anyhow, Context as _, Result};
+use itertools::Itertools;
 use std::{
     cell::RefCell,
     collections::{hash_map::Entry, HashMap},
     fs,
     io::Read,
     ops::Range,
-    panic::Location,
     path::PathBuf,
 };
 use tree_sitter::{Node, Parser, Point, Tree};
@@ -184,16 +184,17 @@ impl File {
         self.record_edit(end..end, insertion);
     }
 
-    pub fn record_info(&self, row: usize, message: String) {
-        self.record_insertion_before_row(row, format!("// REFACTOR: {message}\n"));
+    pub fn record_error(&self, row: usize, message: String) {
+        self.record_info(row, format!("ERROR {message}"));
     }
 
-    #[track_caller]
-    pub fn record_error(&self, row: usize, message: String) {
-        let caller = Location::caller();
+    pub fn record_info(&self, row: usize, message: String) {
         self.record_insertion_before_row(
             row,
-            format!("// REFACTOR ERROR: {message}\n// {caller}\n"),
+            message
+                .lines()
+                .map(|line| format!("// REFACTOR {line}\n"))
+                .join(""),
         );
     }
 

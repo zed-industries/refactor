@@ -54,7 +54,7 @@ pub enum Symbol {
 }
 
 impl Symbol {
-    pub fn text(&self) -> &Arc<str> {
+    pub fn text(&self) -> &str {
         match self {
             Symbol::Local(LocalSymbol(text)) => text,
             Symbol::Global(GlobalSymbol(text)) => text,
@@ -175,15 +175,34 @@ impl Index {
 }
 
 impl Document {
-    pub fn lookup_symbol<'s, 'i: 's>(
-        &'s self,
+    pub fn lookup_symbol<'a>(
+        &'a self,
         symbol: &Symbol,
-        index: &'i Index,
-    ) -> Option<&'s SymbolInformation> {
+        index: &'a Index,
+    ) -> Option<&'a SymbolInformation> {
         match symbol {
             Symbol::Global(global) => index.symbols.get(global),
             Symbol::Local(local) => self.locals.get(local),
         }
+    }
+
+    pub fn lookup_point<'a>(
+        &'a self,
+        point: &Point,
+        index: &'a Index,
+    ) -> Result<&'a SymbolInformation> {
+        let symbol = self.find_occurrence(point)?.symbol.clone();
+        match self.lookup_symbol(&symbol, &index) {
+            Some(symbol_info) => Ok(symbol_info),
+            None => Err(anyhow::anyhow!("Missing symbol info for {symbol:?}")),
+        }
+    }
+    pub fn lookup_node<'a>(
+        &'a self,
+        node: tree_sitter::Node,
+        index: &'a Index,
+    ) -> Result<&'a SymbolInformation> {
+        self.lookup_point(&node.start_position(), index)
     }
 
     pub fn find_occurrence(&self, point: &Point) -> Result<&Occurrence> {
@@ -237,6 +256,16 @@ impl Occurrence {
 
     pub fn range_string(&self, relative_path: &RelativePath) -> String {
         format!("{}:{}-{}", relative_path, self.range.start, self.range.end)
+    }
+}
+
+impl SymbolInformation {
+    pub fn signature(&self) -> String {
+        self.signature_documentation
+            .clone()
+            .unwrap()
+            .text
+            .to_string()
     }
 }
 

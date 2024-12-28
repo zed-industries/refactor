@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context as _, Result};
 use clap::Parser as ClapParser;
 use itertools::Itertools;
 use refactor::{file_editor::*, scip_index::*};
-use std::{iter, path::PathBuf, str::FromStr, sync::Arc};
+use std::{io::Write, iter, path::PathBuf, str::FromStr, sync::Arc};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
@@ -33,7 +33,6 @@ fn main() -> Result<()> {
 struct Refactor {
     editor: FileEditor,
     index: Index,
-    root_folder: PathBuf,
     function_type_query: Query,
     imports_query: Query,
 }
@@ -58,7 +57,6 @@ impl Refactor {
         Ok(Self {
             editor,
             index,
-            root_folder,
             function_type_query,
             imports_query,
         })
@@ -69,7 +67,8 @@ impl Refactor {
 
         // display_locals(&signature_to_locals)
 
-        for local_info in locals.into_iter() {
+        let locals_len = locals.len();
+        for (local_ix, local_info) in locals.into_iter().enumerate() {
             let signature: String = local_info.type_signature.to_string();
             if signature != "&mut WindowContext"
                 && signature != "&mut WindowContext<'a>"
@@ -120,27 +119,56 @@ impl Refactor {
             if !used_window {
                 window_name = "_window";
             }
-            match Self::split_parameter(
-                &local_info.definition,
-                &window_name,
-                &cx_name,
-                &mut file,
-                &document,
-            ) {
+            match Self::split_parameter(&local_info.definition, &window_name, &cx_name, &mut file) {
                 Ok(names) => names,
                 Err(e) => {
                     file.record_error(local_info.definition.range.start.row, format!("{e}"));
                     continue;
                 }
             };
+            show_progress(
+                "Staging local variable splitting edits:",
+                local_ix,
+                locals_len,
+                "variables",
+            );
         }
 
-        for file in self.editor.files.values_mut() {
+        let window_context_symbol = Symbol::Global(GlobalSymbol(
+            "rust-analyzer cargo gpui 0.1.0 window/WindowContext#".into(),
+        ));
+
+        for (document_ix, document) in self.index.documents.values().enumerate() {
+            let file = self.editor.file(&document.relative_path).unwrap();
+            for occurrence in document.occurrences.iter() {
+                if occurrence.symbol != window_context_symbol {
+                    continue;
+                }
+                match Self::handle_window_context_mention(&occurrence, file) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        file.record_error(occurrence.range.start.row, format!("{e}"));
+                        continue;
+                    }
+                };
+            }
+            show_progress(
+                "Staging edits for other WindowContext mentions:",
+                document_ix,
+                self.index.documents.len(),
+                "files",
+            );
+        }
+
+        let files_len = self.editor.files.len();
+        for (file_ix, file) in self.editor.files.values_mut().enumerate() {
             if file.edits.borrow().is_empty() {
                 continue;
             }
             Self::stage_import_edits(file, &self.imports_query);
+            show_progress("Staging import edits:", file_ix, files_len, "files");
         }
+        println!();
     }
 
     fn split_parameter(
@@ -148,7 +176,6 @@ impl Refactor {
         window: &str,
         cx: &str,
         file: &mut File,
-        document: &Document,
     ) -> Result<()> {
         let node = file.find_node(&parameter.range)?;
         let parent0 = node.parent().unwrap();
@@ -157,21 +184,20 @@ impl Refactor {
         let edit_closure_parameter =
             || file.record_node_replacement(node, format!("{window}, {cx}"));
         let edit_fn_parameter = || {
-            match extract_type_signature(file.node_text(parent0))?.as_str() {
-                "&WindowContext" | "&WindowContext<'_>" => file.record_node_replacement(
-                    parent0,
-                    format!("{window}: &Window, {cx}: &AppContext"),
-                ),
-                "&mut WindowContext" | "&mut WindowContext<'_>" => file.record_node_replacement(
-                    parent0,
-                    format!("{window}: &mut Window, {cx}: &mut AppContext"),
-                ),
-                "&'a WindowContext" => file.record_node_replacement(
-                    parent0,
-                    format!("{window}: &'a Window, {cx}: &'a AppContext"),
-                ),
+            let replacement = match extract_type_signature(file.node_text(parent0))?.as_str() {
+                "&WindowContext" => format!("{window}: &Window, {cx}: &AppContext"),
+                "&WindowContext<'_>" => format!("{window}: &'_ Window, {cx}: &'_ AppContext"),
+                "&mut WindowContext" => format!("{window}: &mut Window, {cx}: &mut AppContext"),
+                "&mut crate::WindowContext" => {
+                    format!("{window}: &mut crate::Window, {cx}: &mut crate::AppContext")
+                }
+                "&mut WindowContext<'_>" => {
+                    format!("{window}: &'_ mut Window, {cx}: &'_ mut AppContext")
+                }
+                "&'a WindowContext" => format!("{window}: &'a Window, {cx}: &'a AppContext"),
                 ty => return Err(anyhow!("Unexpected type {}", ty)),
-            }
+            };
+            file.record_node_replacement(parent0, replacement);
             Ok(())
         };
 
@@ -183,7 +209,9 @@ impl Refactor {
                 Err(_) => edit_closure_parameter(),
                 Ok(()) => {}
             },
-            (parent0, parent1) => return Err(anyhow!("{parent0} {parent1}")),
+            (parent0, parent1) => {
+                return Err(anyhow!("Unexpected parameter parents: {parent0} {parent1}"))
+            }
         }
 
         Ok(())
@@ -207,9 +235,72 @@ impl Refactor {
             parent1.grammar_name(),
             parent2.grammar_name(),
         ) {
+            // ...method(.. cx ..)
             ("arguments", "call_expression", _) => {
-                file.record_node_replacement(node, format!("{window}, {cx}"));
-                Ok(true)
+                let argument_index = index_in_parent_named_children(node);
+                let function_identifier = call_expression_function_identifier(parent1)?;
+                let function_symbol = document
+                    .find_occurrence(&function_identifier.start_position())?
+                    .symbol
+                    .clone();
+                let (is_window_context, is_app_context) = match function_symbol.text() {
+                    "rust-analyzer cargo ui 0.1.0 styles/spacing/impl#[DynamicSpacing]px()."
+                    | "rust-analyzer cargo ui 0.1.0 styles/spacing/impl#[DynamicSpacing]rems()." => {
+                        (true, false)
+                    }
+                    _ => {
+                        let function_info = match document.lookup_symbol(&function_symbol, &index) {
+                            Some(symbol_info) => symbol_info,
+                            None => {
+                                return Err(anyhow::anyhow!(
+                                    "Missing symbol info for {function_symbol:?}"
+                                ))
+                            }
+                        };
+                        let signature = function_info.signature();
+                        let (parsed_signature_tree, signature) = parse_signature(signature)?;
+                        let parsed_signature = parsed_signature_tree.root_node().child(0).unwrap();
+                        let parameters =
+                            signature_parameters(parsed_signature, &signature, function_type_query)
+                                .with_context(|| {
+                                    format!("Parsing function signature {signature}")
+                                })?;
+                        let argument_index = if parameters.named_child(0).unwrap().grammar_name()
+                            == "self_parameter"
+                        {
+                            argument_index + 1
+                        } else {
+                            argument_index
+                        };
+                        let parameter =
+                            parameters.named_child(argument_index).with_context(|| {
+                                format!("Getting argument {argument_index} of {signature}")
+                            })?;
+                        let parameter_text = &signature[parameter.byte_range()];
+                        let is_window_context = parameter_text.contains("WindowContext");
+                        let is_app_context = parameter_text.contains("AppContext")
+                            || parameter_text.ends_with("&mut C")
+                            || parameter_text.ends_with("&C");
+                        if !is_window_context && !is_app_context {
+                            return
+                            Err(anyhow!(
+                                "Parameter {} contains neither WindowContext or AppContext. Signature: {}",
+                                parameter_text,
+                                signature
+                            ));
+                        }
+                        (is_window_context, is_app_context)
+                    }
+                };
+
+                if is_window_context {
+                    file.record_node_replacement(node, format!("{window}, {cx}"));
+                    Ok(true)
+                } else if is_app_context {
+                    Ok(false)
+                } else {
+                    panic!("Impossible")
+                }
             }
             // cx.method(...)
             ("field_expression", "call_expression", _)
@@ -232,8 +323,11 @@ impl Refactor {
 
                 if is_window_context {
                     let method_info = document.lookup_symbol(&method_symbol, &index).unwrap();
+                    let signature = method_info.signature();
+                    let (parsed_signature_tree, signature) = parse_signature(signature)?;
                     let parameter_index = index_of_first_function_type_parameter(
-                        &method_info.signature_documentation.clone().unwrap().text,
+                        parsed_signature_tree.root_node(),
+                        &signature,
                         &function_type_query,
                     );
                     let arguments = node_ancestors(node)
@@ -250,9 +344,14 @@ impl Refactor {
                             format!("cx, "),
                         );
                     } else {
+                        let replacement = if arguments.named_child_count() == 0 {
+                            format!("{cx}")
+                        } else {
+                            format!(", {cx}")
+                        };
                         file.record_insertion_before_node(
                             last_child(arguments).unwrap(),
-                            format!(", cx"),
+                            replacement,
                         );
                     }
                     Ok(true)
@@ -265,7 +364,26 @@ impl Refactor {
                     ));
                 }
             }
-            (parent0, parent1, parent2) => return Err(anyhow!("{parent0} {parent1} {parent2}")),
+            ("field_expression", _, _)
+                if parent0.named_child(1).map(|field| file.node_text(field)) == Some("window") =>
+            {
+                file.record_node_replacement(parent1, window.to_string());
+                Ok(true)
+            }
+            ("token_tree", _, _) => {
+                // Could probably support this by separately parsing the code within the macro
+                // invocation, and then converting ranges to/from for queries, but that would be a
+                // lot of work.
+                //
+                // FIXME
+                // return Err(anyhow!("Can't refactor inside macro invocations."));
+                Ok(false)
+            }
+            (parent0, parent1, parent2) => {
+                return Err(anyhow!(
+                    "Unexpected reference parents: {parent0} {parent1} {parent2}"
+                ))
+            }
         }
     }
 
@@ -297,6 +415,67 @@ impl Refactor {
             }
         }
         results
+    }
+
+    fn handle_window_context_mention(occurrence: &Occurrence, file: &mut File) -> Result<()> {
+        let node = file.find_node(&occurrence.range)?;
+
+        if let Some(_) =
+            node_ancestors(node).find(|ancestor| ancestor.grammar_name() == "function_type")
+        {
+            let parameter = iter::once(node)
+                .chain(node_ancestors(node))
+                .zip(node_ancestors(node))
+                .find(|(_, ancestor)| ancestor.grammar_name() == "parameters")
+                .unwrap()
+                .0;
+            let replacement = match file.node_text(parameter) {
+                "&WindowContext" => "&Window, &AppContext",
+                "&mut WindowContext" => "&mut Window, &mut AppContext",
+                "&mut WindowContext<'_>" => "&'_ mut Window, &'_ mut AppContext",
+                reference_text => {
+                    return Err(anyhow!(
+                        "Unexpected function type parameter {reference_text}"
+                    ));
+                }
+            };
+            file.record_node_replacement(parameter, replacement.to_string());
+            return Ok(());
+        }
+
+        let parent0 = node.parent().unwrap();
+        let parent1 = parent0.parent().unwrap();
+        let parent2 = parent1.parent();
+        let parameter = match (
+            parent0.grammar_name(),
+            parent1.grammar_name(),
+            parent2.map(|parent2| parent2.grammar_name()),
+        ) {
+            ("reference_type", "parameter", _) => Some(parent1),
+            ("generic_type", "reference_type", Some("parameter")) => Some(parent2.unwrap()),
+            _ => None,
+        };
+
+        if let Some(parameter) = parameter {
+            if parameter
+                .child_by_field_name("pattern")
+                .unwrap()
+                .grammar_name()
+                == "_"
+            {
+                let replacement = match file.node_text(parent1) {
+                    "_: &WindowContext" => "_: &Window, _: &AppContext",
+                    "_: &mut WindowContext" => "_: &mut Window, _: &mut AppContext",
+                    parameter_text => {
+                        return Err(anyhow!("Unexpected _: parameter {parameter_text}"));
+                    }
+                };
+                file.record_node_replacement(parent1, replacement.to_string());
+                return Ok(());
+            }
+        }
+
+        Ok(())
     }
 
     fn stage_import_edits(file: &mut File, imports_query: &Query) {
@@ -356,37 +535,96 @@ fn is_window_context_signature(signature: &str) -> bool {
     && !signature.contains("AsyncWindowContext")
 }
 
+fn call_expression_function_identifier(call_expression: Node) -> Result<Node> {
+    let mut node = call_expression.child_by_field_name("function").unwrap();
+    loop {
+        node = match node.grammar_name() {
+            "identifier" => return Ok(node),
+            "field_expression" => node.child_by_field_name("field").unwrap(),
+            "scoped_identifier" => node.child_by_field_name("name").unwrap(),
+            "generic_function" => node.child_by_field_name("function").unwrap(),
+            name => {
+                return Err(anyhow!(
+                    "Unexpected node type in call_expression_method: {name}"
+                ))
+            }
+        };
+    }
+}
+
+fn signature_parameters<'a>(
+    signature: Node<'a>,
+    code: &str,
+    function_type_query: &Query,
+) -> Option<Node<'a>> {
+    match signature.child_by_field_name("parameters") {
+        Some(parameters) => Some(parameters),
+        None => {
+            let mut query_cursor = QueryCursor::new();
+            let mut matches =
+                query_cursor.matches(&function_type_query, signature, code.as_bytes());
+            while let Some(match_) = matches.next() {
+                let function_type = match_.nodes_for_capture_index(0).next().unwrap();
+                return function_type.child_by_field_name("parameters");
+            }
+            None
+        }
+    }
+}
+
 /// Find the index of the first closure-taking parameter in the function. Probably should have just
 /// hardcoded this.
 fn index_of_first_function_type_parameter(
-    signature: &str,
+    signature: Node,
+    code: &str,
     function_type_query: &Query,
 ) -> Option<usize> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .unwrap();
-    let tree = parser.parse(&signature, None).unwrap();
     let mut query_cursor = QueryCursor::new();
-    let mut matches =
-        query_cursor.matches(&function_type_query, tree.root_node(), signature.as_bytes());
+    let mut matches = query_cursor.matches(&function_type_query, signature, code.as_bytes());
     while let Some(match_) = matches.next() {
         let function_type = match_.nodes_for_capture_index(0).next().unwrap();
         let parameter = node_ancestors(function_type)
             .find(|ancestor| ancestor.grammar_name() == "parameter")?;
-        let parameter_id = parameter.id();
-        let parameters = parameter.parent().unwrap();
-        let cursor = &mut parameters.walk();
-        return Some(
-            parameters
-                .named_children(cursor)
-                .enumerate()
-                .find(|(_, x)| x.id() == parameter_id)
-                .unwrap()
-                .0,
-        );
+        return Some(index_in_parent_named_children(parameter));
     }
     None
+}
+
+fn index_in_parent_named_children(node: Node) -> usize {
+    let node_id = node.id();
+    let parent = node.parent().unwrap();
+    let cursor = &mut parent.walk();
+    let result = parent
+        .named_children(cursor)
+        .enumerate()
+        .find(|(_, x)| x.id() == node_id)
+        .unwrap()
+        .0;
+    result
+}
+
+fn parse_signature(input_signature: String) -> Result<(tree_sitter::Tree, String)> {
+    let signature = format!("{input_signature};");
+    let tree = parse_rust(&signature);
+    if tree.root_node().child(0).unwrap().grammar_name() == "function_signature_item" {
+        return Ok((tree, signature));
+    }
+
+    let signature = format!("let {input_signature}");
+    let tree = parse_rust(signature.as_str());
+    if tree.root_node().child(0).unwrap().grammar_name() == "let_declaration" {
+        return Ok((tree, signature));
+    }
+
+    Err(anyhow!("Failed to parse signature: {input_signature}"))
+}
+
+fn parse_rust(code: &str) -> tree_sitter::Tree {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .unwrap();
+    parser.parse(&code, None).unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -452,4 +690,17 @@ fn node_children_to_string(node: Node) -> String {
 
 fn last_child<'a>(node: Node<'a>) -> Option<Node<'a>> {
     node.child(node.child_count() - 1)
+}
+
+fn show_progress(action: &str, index: usize, length: usize, things: &str) {
+    let progress = (index + 1) as f32 / length as f32;
+    print!(
+        "\r\u{1b}[K{} {}/{} {} ({:.1}%)",
+        action,
+        index + 1,
+        length,
+        things,
+        progress * 100.0
+    );
+    std::io::stdout().flush().unwrap();
 }
