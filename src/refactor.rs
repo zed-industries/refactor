@@ -439,10 +439,10 @@ impl Refactor {
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            // self.stage_param_edits(document, &source, root_node, relative_path, need_window);
-            // self.stage_function_type_edits(&source, root_node, relative_path);
-            self.stage_closure_edits(document, &source, root_node, relative_path);
-            // self.stage_import_edits(&source, root_node, relative_path);
+            self.stage_param_edits(document, &source, root_node, relative_path, need_window);
+            self.stage_function_type_edits(&source, root_node, relative_path);
+            self.stage_closure_param_edits(document, &source, root_node, relative_path);
+            self.stage_import_edits(&source, root_node, relative_path);
 
             let progress = (index + 1) as f32 / total_documents as f32;
             print!(
@@ -551,57 +551,60 @@ impl Refactor {
         }
     }
 
-    fn stage_closure_edits(
+    fn stage_closure_param_edits(
         &mut self,
         document: &Document,
         source: &str,
         node: Node,
         relative_path: &Arc<str>,
     ) {
-        self.find_sparse_path_matches(
-            node,
-            &["call_expression", "arguments", "closure_expression"],
-            source,
-            |this, path| {
-                let function = path[0].child_by_field_name("function").unwrap();
-                let fn_occurrence = match function.kind() {
-                    "field_expression" => {
-                        let field = function.child_by_field_name("field").unwrap();
-                        this.find_occurrence(document, field.start_position()).ok()
-                    }
-                    "generic_function" | "identifier" => this
-                        .find_occurrence(document, function.start_position())
-                        .ok(),
-                    "scoped_identifier" => {
-                        let name = function.child_by_field_name("name").unwrap();
-                        this.find_occurrence(document, name.start_position()).ok()
-                    }
-                    _ => None,
-                };
-
-                if let Some(fn_occurrence) = fn_occurrence {
-                    if this
+        let filtered_occurrences: Vec<_> = document
+            .occurrences
+            .iter()
+            .filter(|occurrence| {
+                occurrence.symbol_roles == 0
+                    && self
                         .fns_taking_window_context_fns
-                        .contains(&fn_occurrence.symbol)
-                    {
-                        println!(
-                            "Found closure with WindowContext fn: {:?}",
-                            fn_occurrence.symbol
-                        );
-                    }
+                        .contains(&occurrence.symbol)
+            })
+            .collect();
+
+        for occurrence in filtered_occurrences {
+            let node = node
+                .named_descendant_for_point_range(occurrence.range.start, occurrence.range.end)
+                .unwrap();
+
+            let mut parent = node;
+            while parent.kind() != "call_expression" {
+                if let Some(new_parent) = parent.parent() {
+                    parent = new_parent;
                 } else {
-                    println!("Missing occurrence for function: {:?}", function.kind());
-                    let function_text = function.utf8_text(source.as_bytes()).unwrap();
-                    let line_number = source[..function.start_byte()].lines().count() + 1;
-                    println!(
-                        "File: {:?}, Line: {}, Function: {}",
-                        relative_path,
-                        line_number,
-                        function_text.lines().next().unwrap_or("")
-                    );
+                    break;
                 }
-            },
-        );
+            }
+
+            let pattern = ["arguments", "closure_expression", "closure_parameters"];
+
+            self.find_sparse_path_matches(node, &pattern, source, |this, path| {
+                let node = path.last().unwrap();
+                let last_param = node.child(node.child_count() - 2);
+                if let Some(last_param) = last_param {
+                    let last_param_text = &source[last_param.byte_range()];
+                    let underscore = if last_param_text.starts_with('_') {
+                        "_"
+                    } else {
+                        ""
+                    };
+                    this.edits
+                        .entry(relative_path.clone())
+                        .or_default()
+                        .push(Edit {
+                            byte_range: last_param.byte_range(),
+                            replacement: format!("{}window, {}", underscore, last_param_text),
+                        });
+                }
+            });
+        }
     }
 
     fn stage_import_edits(&mut self, source: &str, root_node: Node, relative_path: &Arc<str>) {
