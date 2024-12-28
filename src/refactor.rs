@@ -638,7 +638,11 @@ impl Refactor {
         }
 
         if let Some(byte_range) = window_context_import {
+            let needs_braces = &source[byte_range.start - 2..byte_range.start] == "::";
             let mut replacement = String::new();
+            if needs_braces {
+                replacement.push_str("{");
+            }
             if !window_imported {
                 replacement.push_str("Window");
             }
@@ -648,7 +652,10 @@ impl Refactor {
                 }
                 replacement.push_str("AppContext");
             }
-            if !replacement.is_empty() {
+            if !window_imported || !app_context_imported {
+                if needs_braces {
+                    replacement.push_str("}");
+                }
                 self.edits
                     .entry(relative_path.clone())
                     .or_default()

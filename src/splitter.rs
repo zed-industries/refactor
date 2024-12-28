@@ -346,7 +346,13 @@ impl Refactor {
                         let replacement = if arguments.named_child_count() == 0 {
                             format!("{cx}")
                         } else {
-                            format!(", {cx}")
+                            if file.node_text(arguments.child(arguments.child_count() - 2).unwrap())
+                                == ","
+                            {
+                                format!("{cx}")
+                            } else {
+                                format!(", {cx}")
+                            }
                         };
                         file.record_insertion_before_node(
                             last_child(arguments).unwrap(),
@@ -510,7 +516,11 @@ impl Refactor {
         }
 
         if let Some(byte_range) = window_context_import {
+            let needs_braces = &file.text[byte_range.start - 2..byte_range.start] == "::";
             let mut replacement = String::new();
+            if needs_braces {
+                replacement.push_str("{");
+            }
             if !window_imported {
                 replacement.push_str("Window");
             }
@@ -520,7 +530,10 @@ impl Refactor {
                 }
                 replacement.push_str("AppContext");
             }
-            if !replacement.is_empty() {
+            if !window_imported || !app_context_imported {
+                if needs_braces {
+                    replacement.push_str("}");
+                }
                 file.record_edit(byte_range, replacement);
             }
         }

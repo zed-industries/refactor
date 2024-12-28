@@ -14,3 +14,7 @@ git checkout .
 cd "$refactor_dir"
 
 cargo run --bin splitter -- "$1"
+
+cd "$1"
+cargo fmt || true
+cd "$refactor_dir"
