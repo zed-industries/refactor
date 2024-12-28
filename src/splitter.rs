@@ -265,16 +265,15 @@ impl Refactor {
                                 .with_context(|| {
                                     format!("Parsing function signature {signature}")
                                 })?;
-                        let argument_index = if parameters.named_child(0).unwrap().grammar_name()
-                            == "self_parameter"
-                        {
-                            argument_index + 1
-                        } else {
-                            argument_index
-                        };
+
+                        let parameter_index = parameter_index_from_argument_index(
+                            parameters,
+                            function_identifier,
+                            argument_index,
+                        );
                         let parameter =
-                            parameters.named_child(argument_index).with_context(|| {
-                                format!("Getting argument {argument_index} of {signature}")
+                            parameters.named_child(parameter_index).with_context(|| {
+                                format!("Getting argument {parameter_index} of {signature}")
                             })?;
                         let parameter_text = &signature[parameter.byte_range()];
                         let is_window_context = parameter_text.contains("WindowContext");
@@ -337,7 +336,7 @@ impl Refactor {
                         .unwrap();
                     let method = file.node_text(method_node);
                     file.record_node_replacement(parent0, format!("{window}.{method}"));
-                    if let Some(parameter_index) = parameter_index {
+                    if let Some((_parameters, parameter_index)) = parameter_index {
                         file.record_insertion_before_node(
                             // -1 for self param.
                             arguments.named_child(parameter_index - 1).unwrap(),
@@ -552,6 +551,42 @@ fn call_expression_function_identifier(call_expression: Node) -> Result<Node> {
     }
 }
 
+fn argument_index_from_parameter_index(
+    parameters: Node,
+    method_identifier: Node,
+    parameter_index: usize,
+) -> usize {
+    if parameters_shifted_by_self(parameters, method_identifier) {
+        parameter_index - 1
+    } else {
+        parameter_index
+    }
+}
+
+fn parameter_index_from_argument_index(
+    parameters: Node,
+    method_identifier: Node,
+    argument_index: usize,
+) -> usize {
+    if parameters_shifted_by_self(parameters, method_identifier) {
+        argument_index + 1
+    } else {
+        argument_index
+    }
+}
+
+fn parameters_shifted_by_self(parameters: Node, method_identifier: Node) -> bool {
+    if method_identifier.parent().unwrap().grammar_name() == "scoped_identifier" {
+        false
+    } else {
+        if parameters.named_child(0).unwrap().grammar_name() == "self_parameter" {
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn signature_parameters<'a>(
     signature: Node<'a>,
     code: &str,
@@ -574,18 +609,21 @@ fn signature_parameters<'a>(
 
 /// Find the index of the first closure-taking parameter in the function. Probably should have just
 /// hardcoded this.
-fn index_of_first_function_type_parameter(
-    signature: Node,
+fn index_of_first_function_type_parameter<'a>(
+    signature: Node<'a>,
     code: &str,
     function_type_query: &Query,
-) -> Option<usize> {
+) -> Option<(Node<'a>, usize)> {
     let mut query_cursor = QueryCursor::new();
     let mut matches = query_cursor.matches(&function_type_query, signature, code.as_bytes());
     while let Some(match_) = matches.next() {
         let function_type = match_.nodes_for_capture_index(0).next().unwrap();
         let parameter = node_ancestors(function_type)
             .find(|ancestor| ancestor.grammar_name() == "parameter")?;
-        return Some(index_in_parent_named_children(parameter));
+        return Some((
+            parameter.parent().unwrap(),
+            index_in_parent_named_children(parameter),
+        ));
     }
     None
 }
