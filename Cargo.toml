@@ -5,6 +5,10 @@ edition = "2021"
 default-run = "refactor"
 
 [[bin]]
+name = "ascribe"
+path = "src/ascribe.rs"
+
+[[bin]]
 name = "refactor"
 path = "src/refactor.rs"
 
@@ -20,8 +24,10 @@ path = "src/print_scip.rs"
 anyhow = "1.0.94"
 clap = { version = "4.5.23", features = ["derive"] }
 lazy_static = "1.5.0"
+lsp-types = "0.97.0"
 protobuf = "3.7.1"
 scip = "0.5.1"
+serde_json = "1.0.134"
 streaming-iterator = "0.1.9"
 tree-sitter = "0.24.5"
 tree-sitter-rust = "0.23.2"
