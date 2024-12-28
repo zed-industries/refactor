@@ -13,15 +13,15 @@ use tree_sitter::{Node, Parser, Point, Tree};
 
 pub struct FileEditor {
     pub parser: Parser,
-    root_folder: PathBuf,
-    files: HashMap<RelativePath, File>,
+    pub root_folder: PathBuf,
+    pub files: HashMap<RelativePath, File>,
 }
 
 pub struct File {
     pub relative_path: RelativePath,
-    tree: Tree,
-    text: String,
-    edits: RefCell<Vec<Edit>>,
+    pub tree: Tree,
+    pub text: String,
+    pub edits: RefCell<Vec<Edit>>,
 }
 
 pub struct Edit {
@@ -171,21 +171,21 @@ impl File {
     }
 
     pub fn record_node_replacement(&self, node: Node, replacement: String) {
-        self.record_edit(node.byte_range(), replacement.as_str());
+        self.record_edit(node.byte_range(), replacement);
     }
 
     pub fn record_insertion_before_node(&self, node: Node, insertion: String) {
         let start = node.start_byte();
-        self.record_edit(start..start, insertion.as_str());
+        self.record_edit(start..start, insertion);
     }
 
     pub fn record_insertion_after_node(&self, node: Node, insertion: String) {
         let end = node.end_byte();
-        self.record_edit(end..end, insertion.as_str());
+        self.record_edit(end..end, insertion);
     }
 
     pub fn record_info(&self, row: usize, message: String) {
-        self.record_insertion_before_row(row, format!("// REFACTOR: {message}\n").as_str());
+        self.record_insertion_before_row(row, format!("// REFACTOR: {message}\n"));
     }
 
     #[track_caller]
@@ -193,11 +193,11 @@ impl File {
         let caller = Location::caller();
         self.record_insertion_before_row(
             row,
-            format!("// REFACTOR ERROR: {message}\n// {caller}\n").as_str(),
+            format!("// REFACTOR ERROR: {message}\n// {caller}\n"),
         );
     }
 
-    pub fn record_insertion_before_row(&self, row: usize, insertion: &str) {
+    pub fn record_insertion_before_row(&self, row: usize, insertion: String) {
         // TODO: There must be a more efficient way.
         let mut current_row = 0;
         let Some((start, _)) = self.text.char_indices().find(|(_, char)| {
@@ -214,10 +214,10 @@ impl File {
         self.record_edit(start..start, insertion)
     }
 
-    pub fn record_edit(&self, byte_range: Range<usize>, replacement: &str) {
+    pub fn record_edit(&self, byte_range: Range<usize>, replacement: String) {
         self.edits.borrow_mut().push(Edit {
             byte_range,
-            replacement: replacement.to_string(),
+            replacement,
         });
     }
 }

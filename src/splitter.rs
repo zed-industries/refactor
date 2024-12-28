@@ -35,6 +35,7 @@ struct Refactor {
     index: Index,
     root_folder: PathBuf,
     function_type_query: Query,
+    imports_query: Query,
 }
 
 impl Refactor {
@@ -52,12 +53,14 @@ impl Refactor {
         let editor = FileEditor::new(parser, root_folder.clone());
 
         let function_type_query = Query::new(&language, "(function_type) @function_type").unwrap();
+        let imports_query = Query::new(&language, include_str!("./imports.scm")).unwrap();
 
         Ok(Self {
             editor,
             index,
             root_folder,
             function_type_query,
+            imports_query,
         })
     }
 
@@ -130,6 +133,13 @@ impl Refactor {
                     continue;
                 }
             };
+        }
+
+        for file in self.editor.files.values_mut() {
+            if file.edits.borrow().is_empty() {
+                continue;
+            }
+            Self::stage_import_edits(file, &self.imports_query);
         }
     }
 
@@ -287,6 +297,55 @@ impl Refactor {
             }
         }
         results
+    }
+
+    fn stage_import_edits(file: &mut File, imports_query: &Query) {
+        let root_node = file.tree.root_node();
+        let source = file.text();
+        let mut query_cursor = QueryCursor::new();
+        let mut matches = query_cursor.matches(&imports_query, root_node, source.as_bytes());
+
+        let mut window_context_import = None;
+        let mut window_imported = false;
+        let mut app_context_imported = false;
+
+        while let Some(match_) = matches.next() {
+            let mut import_name = "";
+            let mut import_range = 0..0;
+
+            for capture in match_.captures {
+                match imports_query.capture_names()[capture.index as usize] {
+                    "import_name" => {
+                        import_name = &source[capture.node.byte_range()];
+                        import_range = capture.node.byte_range();
+                    }
+                    _ => {}
+                }
+            }
+
+            match import_name {
+                "WindowContext" => window_context_import = Some(import_range),
+                "Window" => window_imported = true,
+                "AppContext" => app_context_imported = true,
+                _ => {}
+            }
+        }
+
+        if let Some(byte_range) = window_context_import {
+            let mut replacement = String::new();
+            if !window_imported {
+                replacement.push_str("Window");
+            }
+            if !app_context_imported {
+                if !replacement.is_empty() {
+                    replacement.push_str(", ");
+                }
+                replacement.push_str("AppContext");
+            }
+            if !replacement.is_empty() {
+                file.record_edit(byte_range, replacement);
+            }
+        }
     }
 }
 
