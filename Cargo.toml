@@ -4,9 +4,20 @@ version = "0.1.0"
 edition = "2021"
 default-run = "refactor"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "refactor"
 path = "src/refactor.rs"
+
+[[bin]]
+name = "refactor2"
+path = "src/refactor2.rs"
+
+[[bin]]
+name = "splitter"
+path = "src/splitter.rs"
 
 [[bin]]
 name = "print_tree"
@@ -26,3 +37,4 @@ streaming-iterator = "0.1.9"
 tree-sitter = "0.24.5"
 tree-sitter-rust = "0.23.2"
 walkdir = "2.5.0"
+itertools = "0.13.0"
