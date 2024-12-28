@@ -34,6 +34,8 @@ struct Refactor {
     index: Index,
     index_folder: PathBuf,
     caller_graph: BTreeMap<Arc<str>, BTreeSet<Arc<str>>>,
+    window_context_methods: BTreeSet<Arc<str>>,
+    fns_taking_window_context_fns: BTreeSet<Arc<str>>,
     edits: BTreeMap<Arc<str>, Vec<Edit>>,
     function_type_parameters_query: Query,
     functions_query: Query,
@@ -133,6 +135,8 @@ impl Refactor {
             index,
             index_folder,
             caller_graph: BTreeMap::new(),
+            window_context_methods: BTreeSet::new(),
+            fns_taking_window_context_fns: BTreeSet::new(),
             edits: BTreeMap::new(),
             function_type_parameters_query: Self::parse_function_type_params_query(),
             functions_query: Self::parse_functions_query(),
@@ -177,9 +181,8 @@ impl Refactor {
 
     pub fn process(&mut self) -> Result<()> {
         self.analyze()?;
-        // let mut window_context_methods = self.find_window_context_methods()?;
-        // let need_window = self.find_transitive_callers(&mut window_context_methods);
-        // self.stage_edits(&need_window)?;
+        let need_window = self.find_transitive_callers(&self.window_context_methods);
+        self.stage_edits(&need_window)?;
 
         Ok(())
     }
@@ -193,7 +196,7 @@ impl Refactor {
             let source = self.load_relative_path(relative_path)?;
             let tree = self.parser.parse(&source, None).unwrap();
             // self.analyze_call_graph(document, tree.root_node())?;
-            self.analyze_fn_params(document, tree.root_node(), &source);
+            self.find_fns_taking_window_fns(document, tree.root_node(), &source);
 
             let progress = (index + 1) as f32 / document_count as f32;
             print!(
@@ -206,6 +209,7 @@ impl Refactor {
         }
         self.index.documents = documents;
         println!("");
+        self.find_window_context_methods()?;
 
         Ok(())
     }
@@ -279,7 +283,7 @@ impl Refactor {
 
     /// Find all "sparse paths" through the Tree-Sitter parse tree
     /// that match the sequence PATTERN in order.
-    fn analyze_fn_params(&mut self, _document: &Document, node: Node, source: &str) {
+    fn find_fns_taking_window_fns(&mut self, document: &Document, node: Node, source: &str) {
         let pattern = [
             "function_item",
             "parameters",
@@ -288,37 +292,35 @@ impl Refactor {
             "type_identifier",
         ];
 
-        self.find_sparse_path_matches(&node, &pattern, source, |path| {
+        self.find_sparse_path_matches(&node, &pattern, source, |this, path| {
             let node = path.last().unwrap();
             if node.kind() == "type_identifier" && &source[node.byte_range()] == "WindowContext" {
                 let function_item = path.first().unwrap().child_by_field_name("name").unwrap();
-                let function_name = function_item.utf8_text(source.as_bytes()).unwrap();
-                let line = function_item.start_position().row + 1;
-                let start_byte = source[..node.start_byte()].rfind('\n').map_or(0, |i| i + 1);
-                let end_byte = source[node.end_byte()..]
-                    .find('\n')
-                    .map_or(source.len(), |i| node.end_byte() + i);
-                let context_line = &source[start_byte..end_byte];
-
-                println!("Found match in function: {} (line {})", function_name, line);
-                println!("Context: {}", context_line);
+                let position = function_item.start_position();
+                if let Ok(occurrence) =
+                    this.find_occurrence(document, position.row, position.column)
+                {
+                    this.fns_taking_window_context_fns
+                        .insert(occurrence.symbol.clone());
+                }
             }
         });
     }
 
     fn find_sparse_path_matches<F>(
-        &self,
+        &mut self,
         node: &Node,
         pattern: &[&str],
         source: &str,
         mut callback: F,
     ) where
-        F: FnMut(&[Node]),
+        F: FnMut(&mut Self, &[Node]),
     {
         let mut cursor = node.walk();
         let mut current_path = Vec::new();
 
         fn dfs<'a, F>(
+            this: &mut Refactor,
             cursor: &mut TreeCursor<'a>,
             current_path: &mut Vec<Node<'a>>,
             pattern_index: usize,
@@ -326,7 +328,7 @@ impl Refactor {
             source: &str,
             callback: &mut F,
         ) where
-            F: FnMut(&[Node]),
+            F: FnMut(&mut Refactor, &[Node]),
         {
             let node = cursor.node();
 
@@ -336,14 +338,22 @@ impl Refactor {
                 current_path.push(node);
 
                 if next_index == pattern.len() {
-                    callback(current_path);
+                    callback(this, current_path);
                     current_path.pop();
                 }
             }
 
             if cursor.goto_first_child() {
                 loop {
-                    dfs(cursor, current_path, next_index, pattern, source, callback);
+                    dfs(
+                        this,
+                        cursor,
+                        current_path,
+                        next_index,
+                        pattern,
+                        source,
+                        callback,
+                    );
 
                     if !cursor.goto_next_sibling() {
                         break;
@@ -359,6 +369,7 @@ impl Refactor {
         }
 
         dfs(
+            self,
             &mut cursor,
             &mut current_path,
             0,
@@ -368,7 +379,7 @@ impl Refactor {
         );
     }
 
-    fn find_window_context_methods(&self) -> Result<BTreeSet<Arc<str>>> {
+    fn find_window_context_methods(&mut self) -> Result<()> {
         let window_rs_path = "crates/gpui/src/window.rs";
         let document_index = self
             .index
@@ -380,20 +391,18 @@ impl Refactor {
 
         let document = &self.index.documents[document_index];
 
-        let mut window_context_methods = BTreeSet::new();
-
         for symbol in &document.symbols {
             if symbol.symbol.contains("/WindowContext#") {
                 if let Kind::Method = symbol.kind {
                     let hash_count = symbol.symbol.matches('#').count();
                     if hash_count == 1 {
-                        window_context_methods.insert(symbol.symbol.clone());
+                        self.window_context_methods.insert(symbol.symbol.clone());
                     }
                 }
             }
         }
 
-        Ok(window_context_methods)
+        Ok(())
     }
 
     fn find_transitive_callers(&self, target_methods: &BTreeSet<Arc<str>>) -> BTreeSet<Arc<str>> {
