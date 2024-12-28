@@ -1,4 +1,5 @@
 use anyhow::Result;
+use heed::{byteorder::BigEndian, types::I32, EnvOpenOptions};
 use lsp_types::{
     lsif::{self, Edge, Vertex},
     NumberOrString,
@@ -16,12 +17,13 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    path: String,
+    lsif_path: String,
 }
 
 struct LsifGraph {
-    vertices: BTreeMap<i32, Vertex>,
-    edges: BTreeMap<i32, Edge>,
+    env: heed::Env,
+    vertices: heed::Database<I32<BigEndian>, heed::types::SerdeJson<Vertex>>,
+    edges: heed::Database<I32<BigEndian>, heed::types::SerdeJson<Edge>>,
 }
 
 struct LsifIndex {
@@ -42,38 +44,58 @@ impl LsifIndex {
             documents: BTreeMap::new(),
         };
 
-        this.populate_documents();
+        // this.populate_documents()?;
 
         Ok(this)
     }
 
-    fn populate_documents(&mut self) {
-        let total = self.graph.vertices.len();
-        for (i, (id, vertex)) in self.graph.vertices.iter().enumerate() {
-            if let Vertex::Document(document) = vertex {
-                self.documents.insert(
-                    *id,
-                    Document {
-                        path: Arc::from(PathBuf::from(document.uri.path().as_str())),
-                    },
-                );
-            }
-            print_progress(i + 1, total, "Populating documents");
-        }
-        println!();
-    }
+    // fn populate_documents(&mut self) -> Result<()> {
+    //     let rtxn = self.graph.env.read_txn()?;
+    //     let total = self.graph.vertices.len(&rtxn)?;
+    //     for (i, item) in self.graph.vertices.iter(&rtxn)?.enumerate() {
+    //         let (id, vertex) = item?;
+    //         if let Vertex::Document(document) = vertex {
+    //             self.documents.insert(
+    //                 id,
+    //                 Document {
+    //                     path: Arc::from(PathBuf::from(document.uri.path().as_str())),
+    //                 },
+    //             );
+    //         }
+    //         print_progress(i + 1, total as usize, "Populating documents");
+    //     }
+    //     println!();
+    //     Ok(())
+    // }
 }
 
 impl LsifGraph {
     fn from_json(path: &Path) -> Result<Self> {
-        let mut graph = LsifGraph {
-            vertices: BTreeMap::new(),
-            edges: BTreeMap::new(),
+        let db_path = path.with_extension("db");
+        std::fs::create_dir_all(&db_path)?;
+        println!("Using database path: {:?}", db_path);
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .max_dbs(128)
+                .map_size(10 * 1024 * 1024 * 1024) // 10 GB
+                .open(db_path)?
+        };
+        let mut wtxn = env.write_txn()?;
+        let vertices = env.create_database(&mut wtxn, Some("vertices"))?;
+        let edges = env.create_database(&mut wtxn, Some("edges"))?;
+        wtxn.commit()?;
+
+        let graph = LsifGraph {
+            env,
+            vertices,
+            edges,
         };
 
         let line_count = BufReader::new(File::open(path)?).lines().count();
         let file = File::open(path)?;
         let reader = BufReader::new(file);
+
+        let mut wtxn = graph.env.write_txn()?;
 
         for (i, line) in reader.lines().enumerate() {
             let line = line?;
@@ -82,16 +104,18 @@ impl LsifGraph {
             let id = parse_id(entry.id);
             match entry.data {
                 lsif::Element::Vertex(vertex) => {
-                    graph.vertices.insert(id, vertex);
+                    graph.vertices.put(&mut wtxn, &id, &vertex)?;
                 }
                 lsif::Element::Edge(edge) => {
-                    graph.edges.insert(id, edge);
+                    graph.edges.put(&mut wtxn, &id, &edge)?;
                 }
             }
 
             print_progress(i + 1, line_count, "Parsing LSIF graph from JSON");
         }
         println!();
+
+        wtxn.commit()?;
 
         Ok(graph)
     }
@@ -107,9 +131,14 @@ fn parse_id(id: NumberOrString) -> i32 {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let lsif_index = LsifIndex::new(PathBuf::from(cli.path.clone()))?;
-    println!("\nNumber of vertices: {}", lsif_index.graph.vertices.len());
-    println!("Number of edges: {}", lsif_index.graph.edges.len());
+    let lsif_path = std::fs::canonicalize(cli.lsif_path)?;
+    let lsif_index = LsifIndex::new(lsif_path)?;
+    let rtxn = lsif_index.graph.env.read_txn()?;
+    println!(
+        "\nNumber of vertices: {}",
+        lsif_index.graph.vertices.len(&rtxn)?
+    );
+    println!("Number of edges: {}", lsif_index.graph.edges.len(&rtxn)?);
 
     Ok(())
 }

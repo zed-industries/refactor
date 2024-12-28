@@ -23,6 +23,7 @@ path = "src/print_scip.rs"
 [dependencies]
 anyhow = "1.0.94"
 clap = { version = "4.5.23", features = ["derive"] }
+heed = "0.21.0"
 lazy_static = "1.5.0"
 lsp-types = "0.97.0"
 protobuf = "3.7.1"
