@@ -3,10 +3,10 @@ use clap::Parser as ClapParser;
 use protobuf::Message;
 use scip::types::{
     symbol_information::Kind, DiagnosticTag, PositionEncoding, ProtocolVersion, Severity,
-    SyntaxKind, TextEncoding,
+    SymbolRole, SyntaxKind, TextEncoding,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::File,
     io::{Read, Write},
     ops::Range,
@@ -180,8 +180,10 @@ impl Refactor {
 
     pub fn process(&mut self) -> Result<()> {
         self.analyze()?;
-        let need_window = self.find_transitive_callers(&self.window_context_methods);
-        self.stage_edits(&need_window)?;
+        let mut fns_taking_window = self.find_transitive_callers(&self.window_context_methods);
+        // Methods on *AppContext call methods that take a window reference, but they don't take a window reference.
+        fns_taking_window.retain(|s| !s.contains("AppContext"));
+        self.stage_edits(&fns_taking_window)?;
 
         Ok(())
     }
@@ -194,7 +196,7 @@ impl Refactor {
             let relative_path = document.relative_path.as_ref();
             let source = self.load_relative_path(relative_path)?;
             let tree = self.parser.parse(&source, None).unwrap();
-            // self.analyze_call_graph(document, tree.root_node())?;
+            self.populate_caller_graph(document, tree.root_node())?;
             self.find_fns_taking_window_fns(document, tree.root_node(), &source);
 
             let progress = (index + 1) as f32 / document_count as f32;
@@ -213,7 +215,7 @@ impl Refactor {
         Ok(())
     }
 
-    fn analyze_call_graph(&mut self, document: &Document, node: Node) -> Result<()> {
+    fn populate_caller_graph(&mut self, document: &Document, node: Node) -> Result<()> {
         let relative_path = document.relative_path.as_ref();
         let source = self.load_relative_path(relative_path)?;
 
@@ -233,12 +235,12 @@ impl Refactor {
                 .next()
                 .unwrap();
 
-            let definition_symbol = match document
-                .occurrences
-                .binary_search_by_key(&function_name.start_position(), |occurrence| {
-                    occurrence.range.start
-                }) {
-                Ok(index) => &document.occurrences[index].symbol,
+            let definition_symbol = match self.find_occurrence(
+                document,
+                function_name.start_position(),
+                Some(SymbolRole::Definition),
+            ) {
+                Ok(occurrence) => &occurrence.symbol,
                 Err(_) => {
                     // We may find definitions syntactically that aren't in the current SCIP index.
                     continue;
@@ -296,7 +298,7 @@ impl Refactor {
             if node.kind() == "type_identifier" && &source[node.byte_range()] == "WindowContext" {
                 let function_item = path.first().unwrap().child_by_field_name("name").unwrap();
                 if let Ok(occurrence) =
-                    this.find_occurrence(document, function_item.start_position())
+                    this.find_occurrence(document, function_item.start_position(), None)
                 {
                     this.fns_taking_window_context_fns
                         .insert(occurrence.symbol.clone());
@@ -388,49 +390,65 @@ impl Refactor {
             })
             .map_err(|_| anyhow::anyhow!("Document not found: {:?}", window_rs_path))?;
 
-        let document = &self.index.documents[document_index];
+        let source =
+            self.load_relative_path(&self.index.documents[document_index].relative_path)?;
+        let tree = self.parser.parse(&source, None).unwrap();
+        let root_node = tree.root_node();
 
-        for symbol in &document.symbols {
-            if symbol.symbol.contains("/WindowContext#") {
-                if let Kind::Method = symbol.kind {
-                    let hash_count = symbol.symbol.matches('#').count();
-                    if hash_count == 1 {
-                        self.window_context_methods.insert(symbol.symbol.clone());
+        let pattern = ["impl_item", "function_item"];
+
+        self.find_sparse_path_matches(root_node, &pattern, &source, |this, path| {
+            let impl_item = path[0];
+            let function_name = path[1].child_by_field_name("name").unwrap();
+            let document = &this.index.documents[document_index];
+
+            if let Some(type_node) = impl_item.child_by_field_name("type") {
+                let type_text = &source[type_node.byte_range()];
+                if type_text.contains("WindowContext") {
+                    if let Ok(occurrence) =
+                        this.find_occurrence(document, function_name.start_position(), None)
+                    {
+                        let symbol = occurrence.symbol.clone();
+                        if symbol.matches('#').count() == 1 {
+                            println!("Found window context method: {}", symbol);
+                            this.window_context_methods.insert(symbol);
+                        }
                     }
                 }
             }
+        });
+
+        println!("Window context methods:");
+        for method in &self.window_context_methods {
+            println!("  {}", method);
         }
 
         Ok(())
     }
 
     fn find_transitive_callers(&self, target_methods: &BTreeSet<Arc<str>>) -> BTreeSet<Arc<str>> {
-        println!(
-            "Finding transitive callers for {} methods",
-            target_methods.len()
-        );
-
         let mut to_visit: Vec<Arc<str>> = target_methods.iter().cloned().collect();
-        let mut visited = BTreeSet::new();
+        let mut transitive_callers = BTreeSet::new();
+        let mut visited = HashSet::new();
 
         while let Some(method) = to_visit.pop() {
             if !visited.insert(method.clone()) {
                 continue;
             }
 
+            transitive_callers.insert(method.clone());
+
             if let Some(callers) = self.caller_graph.get(&method) {
                 for caller in callers {
-                    if !visited.contains(caller) {
-                        to_visit.push(caller.clone());
-                    }
+                    to_visit.push(caller.clone());
                 }
             }
         }
 
-        visited
+        transitive_callers
     }
 
-    fn stage_edits(&mut self, need_window: &BTreeSet<Arc<str>>) -> Result<()> {
+    fn stage_edits(&mut self, fns_taking_window: &BTreeSet<Arc<str>>) -> Result<()> {
         let documents = std::mem::take(&mut self.index.documents);
         let total_documents = documents.len();
         for (index, document) in documents.iter().enumerate() {
@@ -439,10 +457,23 @@ impl Refactor {
             let tree = self.parser.parse(&source, None).unwrap();
             let root_node = tree.root_node();
 
-            self.stage_param_edits(document, &source, root_node, relative_path, need_window);
-            self.stage_function_type_edits(&source, root_node, relative_path);
-            self.stage_closure_param_edits(document, &source, root_node, relative_path);
             self.stage_import_edits(&source, root_node, relative_path);
+            self.stage_fn_param_edits(
+                document,
+                &source,
+                root_node,
+                relative_path,
+                fns_taking_window,
+            );
+            self.stage_function_type_param_edits(&source, root_node, relative_path);
+            self.stage_closure_param_edits(document, &source, root_node, relative_path);
+            self.stage_fn_argument_edits(
+                document,
+                &source,
+                root_node,
+                relative_path,
+                fns_taking_window,
+            );
 
             let progress = (index + 1) as f32 / total_documents as f32;
             print!(
@@ -458,7 +489,60 @@ impl Refactor {
         Ok(())
     }
 
-    fn stage_param_edits(
+    fn stage_import_edits(&mut self, source: &str, root_node: Node, relative_path: &Arc<str>) {
+        let mut query_cursor = QueryCursor::new();
+        let mut matches = query_cursor.matches(&self.imports_query, root_node, source.as_bytes());
+
+        let mut window_context_import = None;
+        let mut window_imported = false;
+        let mut app_context_imported = false;
+
+        while let Some(match_) = matches.next() {
+            let mut import_name = "";
+            let mut import_range = 0..0;
+
+            for capture in match_.captures {
+                match self.imports_query.capture_names()[capture.index as usize] {
+                    "import_name" => {
+                        import_name = &source[capture.node.byte_range()];
+                        import_range = capture.node.byte_range();
+                    }
+                    _ => {}
+                }
+            }
+
+            match import_name {
+                "WindowContext" => window_context_import = Some(import_range),
+                "Window" => window_imported = true,
+                "AppContext" => app_context_imported = true,
+                _ => {}
+            }
+        }
+
+        if let Some(byte_range) = window_context_import {
+            let mut replacement = String::new();
+            if !window_imported {
+                replacement.push_str("Window");
+            }
+            if !app_context_imported {
+                if !replacement.is_empty() {
+                    replacement.push_str(", ");
+                }
+                replacement.push_str("AppContext");
+            }
+            if !replacement.is_empty() {
+                self.edits
+                    .entry(relative_path.clone())
+                    .or_default()
+                    .push(Edit {
+                        byte_range,
+                        replacement,
+                    });
+            }
+        }
+    }
+
+    fn stage_fn_param_edits(
         &mut self,
         document: &Document,
         source: &str,
@@ -488,7 +572,8 @@ impl Refactor {
                     .unwrap();
 
                 let function_symbol =
-                    match self.find_occurrence(document, function_name_node.start_position()) {
+                    match self.find_occurrence(document, function_name_node.start_position(), None)
+                    {
                         Ok(occurrence) => occurrence.symbol.clone(),
                         Err(_) => {
                             continue;
@@ -523,7 +608,12 @@ impl Refactor {
         }
     }
 
-    fn stage_function_type_edits(&mut self, source: &str, node: Node, relative_path: &Arc<str>) {
+    fn stage_function_type_param_edits(
+        &mut self,
+        source: &str,
+        node: Node,
+        relative_path: &Arc<str>,
+    ) {
         let query = &self.function_type_parameters_query;
         let param_ix = query.capture_index_for_name("parameter").unwrap();
         let param_type_ix = query.capture_index_for_name("parameter.type").unwrap();
@@ -607,55 +697,114 @@ impl Refactor {
         }
     }
 
-    fn stage_import_edits(&mut self, source: &str, root_node: Node, relative_path: &Arc<str>) {
-        let mut query_cursor = QueryCursor::new();
-        let mut matches = query_cursor.matches(&self.imports_query, root_node, source.as_bytes());
+    fn stage_fn_argument_edits(
+        &mut self,
+        document: &Document,
+        source: &str,
+        node: Node,
+        relative_path: &Arc<str>,
+        fns_taking_window: &BTreeSet<Arc<str>>,
+    ) {
+        let mut cursor = node.walk();
+        let filtered_occurrences: Vec<_> = document
+            .occurrences
+            .iter()
+            .filter(|occurrence| {
+                occurrence.symbol_roles == 0 && fns_taking_window.contains(&occurrence.symbol)
+            })
+            .collect();
 
-        let mut window_context_import = None;
-        let mut window_imported = false;
-        let mut app_context_imported = false;
+        for occurrence in filtered_occurrences {
+            let node = node
+                .named_descendant_for_point_range(occurrence.range.start, occurrence.range.end)
+                .unwrap();
 
-        while let Some(match_) = matches.next() {
-            let mut import_name = "";
-            let mut import_range = 0..0;
+            let mut call_expression_node = node;
+            while call_expression_node.kind() != "call_expression" {
+                if let Some(new_parent) = call_expression_node.parent() {
+                    call_expression_node = new_parent;
+                } else {
+                    break;
+                }
+            }
 
-            for capture in match_.captures {
-                match self.imports_query.capture_names()[capture.index as usize] {
-                    "import_name" => {
-                        import_name = &source[capture.node.byte_range()];
-                        import_range = capture.node.byte_range();
+            if call_expression_node.kind() == "call_expression" {
+                if occurrence.symbol.contains("/WindowContext#") {
+                    let field_expr = call_expression_node
+                        .child_by_field_name("function")
+                        .unwrap();
+
+                    if field_expr.kind() == "field_expression" {
+                        if let Some(receiver) = field_expr.child_by_field_name("value") {
+                            self.edits
+                                .entry(relative_path.clone())
+                                .or_default()
+                                .push(Edit {
+                                    byte_range: receiver.byte_range(),
+                                    replacement: "window".to_string(),
+                                });
+                        }
+
+                        if let Some(arguments) =
+                            call_expression_node.child_by_field_name("arguments")
+                        {
+                            if arguments.named_child_count() == 0 {
+                                self.edits
+                                    .entry(relative_path.clone())
+                                    .or_default()
+                                    .push(Edit {
+                                        byte_range: arguments.byte_range(),
+                                        replacement: "(cx)".to_string(),
+                                    });
+                            } else {
+                                let last_argument = arguments
+                                    .named_child(arguments.named_child_count() - 1)
+                                    .unwrap();
+                                if last_argument.kind() == "closure_expression" {
+                                    self.edits.entry(relative_path.clone()).or_default().push(
+                                        Edit {
+                                            byte_range: last_argument.start_byte()
+                                                ..last_argument.start_byte(),
+                                            replacement: "cx, ".to_string(),
+                                        },
+                                    );
+                                } else {
+                                    self.edits.entry(relative_path.clone()).or_default().push(
+                                        Edit {
+                                            byte_range: last_argument.end_byte()
+                                                ..last_argument.end_byte(),
+                                            replacement: ", cx".to_string(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
-                    _ => {}
-                }
-            }
+                } else {
+                    let arguments_node = call_expression_node
+                        .child_by_field_name("arguments")
+                        .unwrap();
+                    let mut cx_argument = None;
+                    for arg in arguments_node.named_children(&mut cursor) {
+                        if arg.kind() == "identifier" {
+                            let arg_text = &source[arg.byte_range()];
+                            if arg_text == "cx" {
+                                cx_argument = Some(arg);
+                                break;
+                            }
+                        }
+                    }
 
-            match import_name {
-                "WindowContext" => window_context_import = Some(import_range),
-                "Window" => window_imported = true,
-                "AppContext" => app_context_imported = true,
-                _ => {}
-            }
-        }
-
-        if let Some(byte_range) = window_context_import {
-            let mut replacement = String::new();
-            if !window_imported {
-                replacement.push_str("Window");
-            }
-            if !app_context_imported {
-                if !replacement.is_empty() {
-                    replacement.push_str(", ");
+                    if let Some(cx_arg) = cx_argument {
+                        self.edits
+                            .entry(relative_path.clone())
+                            .or_default()
+                            .push(Edit {
+                                byte_range: cx_arg.byte_range(),
+                                replacement: "window, cx".to_string(),
+                            });
+                    }
                 }
-                replacement.push_str("AppContext");
-            }
-            if !replacement.is_empty() {
-                self.edits
-                    .entry(relative_path.clone())
-                    .or_default()
-                    .push(Edit {
-                        byte_range,
-                        replacement,
-                    });
             }
         }
     }
@@ -704,10 +853,25 @@ impl Refactor {
         &self,
         document: &'a Document,
         start_point: Point,
+        role: Option<scip::types::SymbolRole>,
     ) -> Result<&'a Occurrence> {
         let occurrence_index = document
             .occurrences
-            .binary_search_by_key(&start_point, |occurrence| occurrence.range.start)
+            .binary_search_by(|occurrence| {
+                let start_cmp = occurrence.range.start.cmp(&start_point);
+                if start_cmp != std::cmp::Ordering::Equal {
+                    return start_cmp;
+                }
+                if let Some(required_role) = role {
+                    if occurrence.symbol_roles & required_role as i32 != 0 {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .map_err(|_| anyhow::anyhow!("Occurrence not found at {:?}", start_point))?;
 
         Ok(&document.occurrences[occurrence_index])
