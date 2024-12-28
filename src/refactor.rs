@@ -116,8 +116,7 @@ pub struct Diagnostic {
 }
 
 struct Edit {
-    start: usize,
-    end: usize,
+    byte_range: Range<usize>,
     replacement: String,
 }
 
@@ -495,8 +494,6 @@ impl Refactor {
                     };
 
                 let param_name = param_name_node.map_or("_", |node| &source[node.byte_range()]);
-                let param_start = param_node.start_byte();
-                let param_end = param_node.end_byte();
 
                 if needs_window.contains(&function_symbol) {
                     let underscore = if param_name.starts_with('_') { "_" } else { "" };
@@ -504,8 +501,7 @@ impl Refactor {
                         .entry(relative_path.clone())
                         .or_default()
                         .push(Edit {
-                            start: param_start,
-                            end: param_end,
+                            byte_range: param_node.byte_range(),
                             replacement: format!(
                                 "{}window: &mut Window, {}: &mut AppContext",
                                 underscore, param_name
@@ -517,8 +513,7 @@ impl Refactor {
                         .entry(relative_path.clone())
                         .or_default()
                         .push(Edit {
-                            start: param_start,
-                            end: param_end,
+                            byte_range: param_node.byte_range(),
                             replacement: format!("{}: &mut AppContext", param_name).to_string(),
                         });
                 }
@@ -541,14 +536,11 @@ impl Refactor {
 
                     if param_type == "WindowContext" {
                         let param_node = match_.nodes_for_capture_index(param_ix).next().unwrap();
-                        let param_start = param_node.start_byte();
-                        let param_end = param_node.end_byte();
                         self.edits
                             .entry(relative_path.clone())
                             .or_default()
                             .push(Edit {
-                                start: param_start,
-                                end: param_end,
+                                byte_range: param_node.byte_range(),
                                 replacement: "&mut Window, &mut AppContext".to_string(),
                             });
                     }
@@ -561,35 +553,33 @@ impl Refactor {
         let mut query_cursor = QueryCursor::new();
         let mut matches = query_cursor.matches(&self.imports_query, root_node, source.as_bytes());
 
-        let mut window_context_import: Option<(usize, usize)> = None;
+        let mut window_context_import = None;
         let mut window_imported = false;
         let mut app_context_imported = false;
 
         while let Some(match_) = matches.next() {
             let mut import_name = "";
-            let mut import_start = 0;
-            let mut import_end = 0;
+            let mut import_range = 0..0;
 
             for capture in match_.captures {
                 match self.imports_query.capture_names()[capture.index as usize] {
                     "import_name" => {
                         import_name = &source[capture.node.byte_range()];
-                        import_start = capture.node.start_byte();
-                        import_end = capture.node.end_byte();
+                        import_range = capture.node.byte_range();
                     }
                     _ => {}
                 }
             }
 
             match import_name {
-                "WindowContext" => window_context_import = Some((import_start, import_end)),
+                "WindowContext" => window_context_import = Some(import_range),
                 "Window" => window_imported = true,
                 "AppContext" => app_context_imported = true,
                 _ => {}
             }
         }
 
-        if let Some((start, end)) = window_context_import {
+        if let Some(byte_range) = window_context_import {
             let mut replacement = String::new();
             if !window_imported {
                 replacement.push_str("Window");
@@ -605,8 +595,7 @@ impl Refactor {
                     .entry(relative_path.clone())
                     .or_default()
                     .push(Edit {
-                        start,
-                        end,
+                        byte_range,
                         replacement,
                     });
             }
@@ -678,20 +667,21 @@ impl Refactor {
             println!("---");
 
             for edit in edits {
-                let start_line = source[..edit.start].lines().count();
-                let end_line = source[..edit.end].lines().count();
-                let context_start = source[..edit.start].rfind('\n').map_or(0, |i| i + 1);
-                let context_end = source[edit.end..]
+                let range = &edit.byte_range;
+                let start_line = source[..range.start].lines().count();
+                let end_line = source[..range.end].lines().count();
+                let context_start = source[..range.start].rfind('\n').map_or(0, |i| i + 1);
+                let context_end = source[range.end..]
                     .find('\n')
-                    .map_or(source.len(), |i| edit.end + i);
+                    .map_or(source.len(), |i| range.end + i);
 
                 println!("Lines {}-{}:", start_line, end_line);
                 println!("- {}", &source[context_start..context_end]);
                 println!(
                     "+ {}{}{}",
-                    &source[context_start..edit.start],
+                    &source[context_start..range.start],
                     edit.replacement,
-                    &source[edit.end..context_end]
+                    &source[range.end..context_end]
                 );
                 println!();
             }
@@ -710,9 +700,12 @@ impl Refactor {
                 .context("Failed to read file")?;
 
             let mut new_source = source.clone();
-            edits.sort_by(|a, b| b.start.cmp(&a.start));
+            edits.sort_by(|a, b| b.byte_range.start.cmp(&a.byte_range.start));
             for edit in edits.iter() {
-                new_source.replace_range(edit.start..edit.end, &edit.replacement);
+                new_source.replace_range(
+                    edit.byte_range.start..edit.byte_range.end,
+                    &edit.replacement,
+                );
             }
 
             std::fs::write(full_path, new_source).context("Failed to write file")?;
