@@ -549,6 +549,7 @@ impl Refactor {
 fn is_window_context_signature(signature: &str) -> bool {
     signature.contains("WindowContext")
     && !signature.contains("Fn")
+    && !signature.contains("fn(")
     // TODO: handle AsyncWindowContext?
     && !signature.contains("AsyncWindowContext")
 }
