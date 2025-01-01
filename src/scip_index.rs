@@ -5,7 +5,7 @@ use scip::types::{
     SymbolRole, SyntaxKind, TextEncoding,
 };
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fmt,
     fs::File,
     io::Read,
@@ -18,8 +18,8 @@ use tree_sitter::Point;
 #[derive(Debug, Clone)]
 pub struct Index {
     pub metadata: Arc<Metadata>,
-    pub documents: HashMap<RelativePath, Document>,
-    pub symbols: HashMap<GlobalSymbol, SymbolInformation>,
+    pub documents: BTreeMap<RelativePath, Document>,
+    pub symbols: BTreeMap<GlobalSymbol, SymbolInformation>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct Document {
     pub relative_path: RelativePath,
     pub language: Arc<str>,
     pub occurrences: Vec<Occurrence>,
-    pub locals: HashMap<LocalSymbol, SymbolInformation>,
+    pub locals: BTreeMap<LocalSymbol, SymbolInformation>,
     pub position_encoding: PositionEncoding,
 }
 
@@ -101,7 +101,7 @@ pub struct SymbolInformation {
 pub struct SignatureDocumentation {
     pub language: Arc<str>,
     pub occurrences: Vec<Occurrence>,
-    pub locals: HashMap<LocalSymbol, SymbolInformation>,
+    pub locals: BTreeMap<LocalSymbol, SymbolInformation>,
     pub text: Arc<str>,
 }
 
@@ -160,8 +160,9 @@ impl Index {
         file.read_to_end(&mut buffer)
             .context("Failed to read index file")?;
 
-        let index = scip::types::Index::parse_from_bytes(&buffer)
+        let mut index = scip::types::Index::parse_from_bytes(&buffer)
             .context("Failed to parse index from bytes")?;
+
         println!("Loaded {} SCIP documents", index.documents.len());
 
         Ok(index.into())
@@ -272,10 +273,10 @@ impl SymbolInformation {
 // TODO: Complain about insertion of duplicates in all use of insert below
 impl From<scip::types::Index> for Index {
     fn from(index: scip::types::Index) -> Self {
-        let mut documents = HashMap::new();
-        let mut symbols = HashMap::new();
+        let mut documents = BTreeMap::new();
+        let mut symbols = BTreeMap::new();
         for document in index.documents.into_iter() {
-            let mut locals = HashMap::new();
+            let mut locals = BTreeMap::new();
             for symbol_info in document.symbols {
                 let converted_symbol: SymbolInformation = symbol_info.into();
                 match converted_symbol.symbol.clone() {
@@ -424,7 +425,7 @@ impl From<scip::types::SymbolInformation> for SymbolInformation {
 
 impl From<scip::types::Document> for SignatureDocumentation {
     fn from(document: scip::types::Document) -> Self {
-        let mut locals = HashMap::new();
+        let mut locals = BTreeMap::new();
         for symbol_info in document.symbols.into_iter() {
             let converted_symbol: SymbolInformation = symbol_info.into();
             match converted_symbol.symbol.clone() {
