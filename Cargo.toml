@@ -16,6 +16,10 @@ name = "refactor2"
 path = "src/refactor2.rs"
 
 [[bin]]
+name = "upgrade"
+path = "src/upgrade.rs"
+
+[[bin]]
 name = "splitter"
 path = "src/splitter.rs"
 

@@ -90,6 +90,10 @@ impl FileEditor {
 
     pub fn display_dry_run_results(&self) {
         for (path, file) in &self.files {
+            if file.edits.borrow().is_empty() {
+                continue;
+            }
+
             let full_path = &self.root_folder.join(path.0.clone());
             println!("File: {:?}", full_path);
             println!("---");
@@ -127,6 +131,10 @@ impl File {
 
     pub fn node_text(&self, node: Node) -> &str {
         &self.text[node.byte_range()]
+    }
+
+    pub fn line(&self, row: usize) -> Option<String> {
+        self.text.lines().nth(row).map(|line| line.to_string())
     }
 
     pub fn find_node(&self, range: &Range<Point>) -> Result<Node> {
