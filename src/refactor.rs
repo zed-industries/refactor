@@ -105,18 +105,24 @@ impl Refactor {
                     }
                 }
                 if occurrence.symbol.text().ends_with("ViewContext#") {
-                    process_view_context_mention(
+                    if let Err(err) = process_view_context_mention(
                         file,
                         document,
                         occurrence,
                         &mut fns_taking_window,
-                    );
+                        &mut fns_taking_window_fn,
+                    ) {
+                        eprintln!("Error processing view context mention: {}", err);
+                    }
                 }
                 if occurrence.symbol.text().ends_with("view/View#") {
                     process_view_mention(file, occurrence);
                 }
             });
         }
+
+        dbg!(&fns_taking_window);
+        dbg!(&fns_taking_window_fn);
 
         // Pass 2: Update fn calls to thread through a window
         for (relative_path, document) in &self.index.documents {
@@ -220,21 +226,29 @@ fn process_view_context_mention(
     file: &mut File,
     document: &Document,
     occurrence: &Occurrence,
-    window_methods: &mut BTreeSet<GlobalSymbol>,
-) {
+    fns_taking_window: &mut BTreeSet<GlobalSymbol>,
+    fns_taking_window_fn: &mut BTreeSet<GlobalSymbol>,
+) -> Result<()> {
     let Ok(node) = file.find_node(&occurrence.range) else {
-        return;
+        bail!("No node found at occurrence range");
     };
 
     let mut generics = None;
+    let mut inside_function_type = false;
     for ancestor in node_ancestors(node) {
         match ancestor.kind() {
             // Capture the <T> from ViewContext<T> for possible use later in a later loop iteration.
             "generic_type" => {
                 generics = file.node_text(ancestor).strip_prefix("ViewContext");
             }
+            // If we're inside a function type, we rewrite the function type parameter.
+            "function_type" => {
+                // Inside an fn
+                inside_function_type = true;
+                file.record_edit(node.byte_range(), format!("Window, &mut ModelContext"));
+            }
             // Replace "cx: &mut ViewContext<T>" with "window: &mut Window, model: &mut ModelContext<T>"
-            "parameter" => {
+            "parameter" if !inside_function_type => {
                 if let Some(generics) = generics {
                     let parameter_name =
                         file.node_text(ancestor.child_by_field_name("pattern").unwrap());
@@ -258,18 +272,20 @@ fn process_view_context_mention(
             // Record this method so we can update calls to it in a second pass.
             "function_item" => {
                 let name_node = ancestor.child_by_field_name("name").unwrap();
-                match document.find_occurrence(&name_node.start_position()) {
-                    Ok(occurrence) => {
-                        window_methods.insert(occurrence.symbol.to_global().unwrap());
-                    }
-                    Err(error) => {
-                        println!("No occurrence found for function name: {}", error);
-                    }
+                let occurence = document.find_occurrence(&name_node.start_position())?;
+                let fn_symbol = occurence.symbol.to_global().unwrap();
+
+                if inside_function_type {
+                    fns_taking_window_fn.insert(fn_symbol);
+                } else {
+                    fns_taking_window.insert(fn_symbol);
                 }
             }
             _ => {}
         }
     }
+
+    Ok(())
 }
 
 fn process_view_mention(file: &mut File, occurrence: &Occurrence) {
@@ -397,6 +413,41 @@ fn update_window_call(
                 }
             }
 
+            // Rewrite window.with_foo(|cx| {}) to window.with_foo(|window| {})
+            if occurrence.symbol.text().contains("]with_") {
+                println!(
+                    "Rewriting with_foo closure argument from cx to window for: {:?}",
+                    occurrence.symbol.text()
+                );
+                let arguments = ancestor.child_by_field_name("arguments").unwrap();
+                let mut cursor = arguments.walk();
+                cursor.goto_first_child();
+                'outer: loop {
+                    println!("Node kind: {}", cursor.node().kind());
+                    if cursor.node().kind() == "closure_expression" {
+                        println!(
+                            "Rewriting with_foo closure argument from cx to window for: {:?}",
+                            occurrence.symbol.text()
+                        );
+                        cursor.reset(cursor.node().child_by_field_name("parameters").unwrap());
+                        cursor.goto_first_child();
+
+                        loop {
+                            if file.node_text(cursor.node()) == "cx" {
+                                file.record_edit(cursor.node().byte_range(), "window".to_string());
+                                break 'outer;
+                            }
+                            if !cursor.goto_next_sibling() {
+                                break;
+                            }
+                        }
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+
             break;
         }
     }
@@ -482,7 +533,6 @@ fn relocated_to_model_context(symbol: &GlobalSymbol) -> (bool, Option<&'static s
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]on_focus_lost().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]on_focus_out().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]on_action().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]emit().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]focus_self()."
     ];
 
@@ -503,7 +553,7 @@ fn takes_window_arg(
         "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]focus().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]is_focused().",
     ];
-    let dont_replace_cx = [
+    let preserve_cx = [
         "rust-analyzer cargo gpui 0.1.0 text_system/line/impl#[ShapedLine]paint().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]contains().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]contains_focused().",
@@ -515,7 +565,12 @@ fn takes_window_arg(
 
     if replace_cx.contains(&symbol.0.as_ref()) {
         Some(true)
-    } else if dont_replace_cx.contains(&symbol.0.as_ref()) {
+    } else if preserve_cx.contains(&symbol.0.as_ref()) {
+        Some(false)
+    } else if symbol.0.ends_with("[Element]request_layout().")
+        || symbol.0.ends_with("[Element]prepaint().")
+        || symbol.0.ends_with("[Element]paint().")
+    {
         Some(false)
     } else if fns_with_window_param.contains(symbol) {
         Some(false)
@@ -559,7 +614,6 @@ fn takes_window_fn(symbol: &GlobalSymbol, fns_taking_window_fn: &BTreeSet<Global
         "rust-analyzer cargo gpui 0.1.0 elements/uniform_list/uniform_list().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[AnyWindowHandle]update().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]defer().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]emit().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]focus_self().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]listener().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]observe().",
