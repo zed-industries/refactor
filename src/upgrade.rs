@@ -69,26 +69,59 @@ impl Refactor {
             "Processing files starting with focus path: {:?}",
             self.focus_path
         );
-        let focused_documents = self.index.documents.iter().filter(|(relative_path, _)| {
+
+        let process_document = |relative_path: &RelativePath| {
             relative_path.0.starts_with(&self.focus_path)
                 && !relative_path.0.starts_with("crates/gpui/src")
-        });
+        };
 
-        let mut view_cx_methods = BTreeSet::new();
+        let mut fns_with_window_param = BTreeSet::new();
 
-        for (relative_path, document) in focused_documents {
+        // Pass 1: Update signatures and detect which methods need to take a Window
+        for (relative_path, document) in &self.index.documents {
+            if !process_document(relative_path) {
+                continue;
+            }
+
             println!("Processing document: {:?}", relative_path);
             let file = self.editor.file(relative_path).unwrap();
+
             process_imports(file, &self.use_list_query);
 
             document.occurrences.iter().for_each(|occurrence| {
                 if occurrence.symbol.text().ends_with("ViewContext#") {
-                    process_view_context_mention(file, document, occurrence, &mut view_cx_methods);
+                    process_view_context_mention(
+                        file,
+                        document,
+                        occurrence,
+                        &mut fns_with_window_param,
+                    );
                 }
             });
         }
 
-        println!("ViewContext methods: {:?}", view_cx_methods);
+        // Pass 2: Update fn calls to thread through a window
+        for (relative_path, document) in &self.index.documents {
+            if !process_document(relative_path) {
+                continue;
+            }
+
+            let file = self.editor.file(relative_path).unwrap();
+
+            document.occurrences.iter().for_each(|occurrence| {
+                if occurrence.symbol_roles == 0 {
+                    if let Symbol::Global(global_symbol) = &occurrence.symbol {
+                        if fns_with_window_param.contains(global_symbol) {
+                            if let Err(err) = add_window_argument(file, occurrence) {
+                                eprintln!("Error adding window parameter: {}", err);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // println!("ViewContext methods: {:?}", fns_with_window_param);
     }
 }
 
@@ -96,16 +129,11 @@ fn process_view_context_mention(
     file: &mut File,
     document: &Document,
     occurrence: &Occurrence,
-    fns_taking_view_cx: &mut BTreeSet<GlobalSymbol>,
+    window_methods: &mut BTreeSet<GlobalSymbol>,
 ) {
     let Ok(node) = file.find_node(&occurrence.range) else {
         return;
     };
-    println!(
-        "Line: {:?}, Symbol: {:?}",
-        file.line(node.range().start_point.row),
-        occurrence.symbol.text()
-    );
 
     let mut generics = None;
     for ancestor in node_ancestors(node) {
@@ -141,7 +169,7 @@ fn process_view_context_mention(
                 let name_node = ancestor.child_by_field_name("name").unwrap();
                 match document.find_occurrence(&name_node.start_position()) {
                     Ok(occurrence) => {
-                        fns_taking_view_cx.insert(occurrence.symbol.to_global().unwrap());
+                        window_methods.insert(occurrence.symbol.to_global().unwrap());
                     }
                     Err(error) => {
                         println!("No occurrence found for function name: {}", error);
@@ -151,6 +179,31 @@ fn process_view_context_mention(
             _ => {}
         }
     }
+}
+
+fn add_window_argument(file: &mut File, occurrence: &Occurrence) -> Result<()> {
+    let node = file.find_node(&occurrence.range)?;
+
+    println!(
+        "Occurrence symbol: {:?}\nLine: {:?}",
+        occurrence.symbol,
+        file.line(node.range().start_point.row).unwrap()
+    );
+
+    for ancestor in node_ancestors(node) {
+        if ancestor.kind() == "call_expression" {
+            let arguments = ancestor.child_by_field_name("arguments").unwrap();
+            let mut cursor = arguments.walk();
+            for child in arguments.named_children(&mut cursor) {
+                if file.node_text(child) == "cx" {
+                    file.record_edit(child.byte_range(), "window, cx".to_string());
+                }
+            }
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 // fn find_occurence(document: &Document, position: scip::types::)
