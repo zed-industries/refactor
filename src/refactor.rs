@@ -124,9 +124,6 @@ impl Refactor {
             });
         }
 
-        dbg!(&fns_taking_window);
-        dbg!(&fns_taking_window_fn);
-
         // Pass 2: Update fn calls to thread through a window
         for (relative_path, document) in &self.index.documents {
             if !process_document(relative_path) {
@@ -340,7 +337,7 @@ fn add_window_fn_param(
 ) -> Result<()> {
     let node = file.find_node(&occurrence.range)?;
 
-    for ancestor in node_ancestors(node) {
+    for ancestor in [node].into_iter().chain(node_ancestors(node)) {
         if ancestor.kind() == "call_expression" {
             let arguments = ancestor.child_by_field_name("arguments").unwrap();
 
@@ -582,7 +579,6 @@ fn takes_window_arg(
 }
 
 fn takes_window_fn(symbol: &GlobalSymbol, fns_taking_window_fn: &BTreeSet<GlobalSymbol>) -> bool {
-    dbg!(&symbol);
     let window_fn_symbols = [
         "rust-analyzer cargo gpui 0.1.0 app/async_context/impl#[AsyncWindowContext]update().",
         "rust-analyzer cargo gpui 0.1.0 app/impl#[AppContext]observe_keystrokes().",
@@ -662,7 +658,7 @@ fn takes_window_fn(symbol: &GlobalSymbol, fns_taking_window_fn: &BTreeSet<Global
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]subscribe().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowHandle<V>`]update().",
     ];
-    dbg!(window_fn_symbols.contains(&symbol.0.as_ref()) || fns_taking_window_fn.contains(&symbol))
+    window_fn_symbols.contains(&symbol.0.as_ref()) || fns_taking_window_fn.contains(&symbol)
 }
 
 fn relocated_to_window(symbol: &GlobalSymbol) -> Option<bool> {
