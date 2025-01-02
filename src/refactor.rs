@@ -38,7 +38,6 @@ struct Refactor {
     editor: FileEditor,
     index: Index,
     use_list_query: Query,
-    closure_query: Query,
 }
 
 impl Refactor {
@@ -60,14 +59,12 @@ impl Refactor {
         let editor = FileEditor::new(parser, root_folder.clone());
 
         let use_list_query = Query::new(&language, "(use_list) @use_list").unwrap();
-        let closure_query = Query::new(&language, "(closure_expression) @closure").unwrap();
 
         Ok(Self {
             focus_path,
             editor,
             index,
             use_list_query,
-            closure_query,
         })
     }
 
@@ -143,8 +140,7 @@ impl Refactor {
                     }
 
                     if takes_window_fn(global_symbol, &fns_taking_window_fn) {
-                        if let Err(err) = add_window_fn_param(file, occurrence, &self.closure_query)
-                        {
+                        if let Err(err) = add_window_fn_param(file, occurrence) {
                             eprintln!("Error adding fn window parameter: {}", err);
                         }
                     }
@@ -330,37 +326,30 @@ fn add_window_argument_before_cx(
     Ok(())
 }
 
-fn add_window_fn_param(
-    file: &mut File,
-    occurrence: &Occurrence,
-    closure_query: &Query,
-) -> Result<()> {
+fn add_window_fn_param(file: &mut File, occurrence: &Occurrence) -> Result<()> {
     let node = file.find_node(&occurrence.range)?;
 
     for ancestor in [node].into_iter().chain(node_ancestors(node)) {
         if ancestor.kind() == "call_expression" {
             let arguments = ancestor.child_by_field_name("arguments").unwrap();
-
-            let mut query_cursor = QueryCursor::new();
-            let mut matches = query_cursor.matches(closure_query, arguments, file.text.as_bytes());
-
-            while let Some(m) = matches.next() {
-                let closure_node = m.captures[0].node;
-                let parameters = closure_node.child_by_field_name("parameters").unwrap();
-                let last_parameter = parameters.child(parameters.child_count() - 2).unwrap();
-                let replacement = if file.node_text(last_parameter) == "_" {
-                    "_, "
-                } else if file.node_text(last_parameter).starts_with("_") {
-                    "_window, "
-                } else {
-                    "window, "
-                };
-                file.record_edit(
-                    last_parameter.start_byte()..last_parameter.start_byte(),
-                    replacement.to_string(),
-                );
+            let mut cursor = arguments.walk();
+            for child in arguments.named_children(&mut cursor) {
+                if child.kind() == "closure_expression" {
+                    let parameters = child.child_by_field_name("parameters").unwrap();
+                    let last_parameter = parameters.child(parameters.child_count() - 2).unwrap();
+                    let replacement = if file.node_text(last_parameter) == "_" {
+                        "_, "
+                    } else if file.node_text(last_parameter).starts_with("_") {
+                        "_window, "
+                    } else {
+                        "window, "
+                    };
+                    file.record_edit(
+                        last_parameter.start_byte()..last_parameter.start_byte(),
+                        replacement.to_string(),
+                    );
+                }
             }
-
             break;
         }
     }
@@ -423,11 +412,20 @@ fn update_window_call(
 
             // Rewrite window.with_foo(|cx| {}) to window.with_foo(|window| {})
             if occurrence.symbol.text().contains("]with_") {
+                println!(
+                    "Rewriting with_foo closure argument from cx to window for: {:?}",
+                    occurrence.symbol.text()
+                );
                 let arguments = ancestor.child_by_field_name("arguments").unwrap();
                 let mut cursor = arguments.walk();
                 cursor.goto_first_child();
                 'outer: loop {
+                    println!("Node kind: {}", cursor.node().kind());
                     if cursor.node().kind() == "closure_expression" {
+                        println!(
+                            "Rewriting with_foo closure argument from cx to window for: {:?}",
+                            occurrence.symbol.text()
+                        );
                         cursor.reset(cursor.node().child_by_field_name("parameters").unwrap());
                         cursor.goto_first_child();
 
