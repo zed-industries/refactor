@@ -49,29 +49,24 @@ fn pretty_print_index(index: &Index) {
 
     // Print documents
     println!("  Documents: {}", index.documents.len());
-    for (i, doc) in index.documents.iter().enumerate() {
-        println!("    Document {}:", i);
-        println!("      Language: {}", doc.language);
-        println!("      Path: {}", doc.relative_path);
-        println!("      Occurrences: {}", doc.occurrences.len());
-        println!("      Symbols: {}", doc.symbols.len());
+    for doc in index.documents.iter() {
+        println!("    {}", doc.relative_path);
 
         // Print all occurrences
         println!("      Occurrences:");
-        for (j, occurrence) in doc.occurrences.iter().enumerate() {
-            println!("        Occurrence {}:", j);
-            println!("          Range: {:?}", occurrence.range);
-            println!("          Symbol: {}", occurrence.symbol);
-            println!("          Symbol Roles: {}", occurrence.symbol_roles);
+        for occurrence in doc.occurrences.iter() {
+            if occurrence.symbol_roles == 1 && !occurrence.symbol.starts_with("local") {
+                println!("        {:?},", occurrence.symbol);
+            }
         }
     }
 
-    // Print external symbols
-    println!("  External Symbols: {}", index.external_symbols.len());
-    for (i, symbol) in index.external_symbols.iter().enumerate() {
-        println!("    Symbol {}:", i);
-        println!("      Name: {}", symbol.symbol);
-        println!("      Documentation: {} lines", symbol.documentation.len());
-        println!("      Relationships: {}", symbol.relationships.len());
-    }
+    // // Print external symbols
+    // println!("  External Symbols: {}", index.external_symbols.len());
+    // for (i, symbol) in index.external_symbols.iter().enumerate() {
+    //     println!("    Symbol {}:", i);
+    //     println!("      Name: {}", symbol.symbol);
+    //     println!("      Documentation: {} lines", symbol.documentation.len());
+    //     println!("      Relationships: {}", symbol.relationships.len());
+    // }
 }

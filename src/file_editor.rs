@@ -90,6 +90,10 @@ impl FileEditor {
 
     pub fn display_dry_run_results(&self) {
         for (path, file) in &self.files {
+            if file.edits.borrow().is_empty() {
+                continue;
+            }
+
             let full_path = &self.root_folder.join(path.0.clone());
             println!("File: {:?}", full_path);
             println!("---");
@@ -121,12 +125,18 @@ impl FileEditor {
 }
 
 impl File {
+    #[allow(unused)]
     pub fn text(&self) -> &str {
         self.text.as_str()
     }
 
     pub fn node_text(&self, node: Node) -> &str {
         &self.text[node.byte_range()]
+    }
+
+    #[allow(unused)]
+    pub fn line(&self, row: usize) -> Option<String> {
+        self.text.lines().nth(row).map(|line| line.to_string())
     }
 
     pub fn find_node(&self, range: &Range<Point>) -> Result<Node> {
@@ -168,20 +178,6 @@ impl File {
                 ));
             }
         }
-    }
-
-    pub fn record_node_replacement(&self, node: Node, replacement: String) {
-        self.record_edit(node.byte_range(), replacement);
-    }
-
-    pub fn record_insertion_before_node(&self, node: Node, insertion: String) {
-        let start = node.start_byte();
-        self.record_edit(start..start, insertion);
-    }
-
-    pub fn record_insertion_after_node(&self, node: Node, insertion: String) {
-        let end = node.end_byte();
-        self.record_edit(end..end, insertion);
     }
 
     pub fn record_error(&self, row: usize, message: String) {

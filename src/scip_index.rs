@@ -5,7 +5,7 @@ use scip::types::{
     SymbolRole, SyntaxKind, TextEncoding,
 };
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fmt,
     fs::File,
     io::Read,
@@ -17,17 +17,22 @@ use tree_sitter::Point;
 
 #[derive(Debug, Clone)]
 pub struct Index {
+    #[allow(unused)]
     pub metadata: Arc<Metadata>,
-    pub documents: HashMap<RelativePath, Document>,
-    pub symbols: HashMap<GlobalSymbol, SymbolInformation>,
+    pub documents: BTreeMap<RelativePath, Document>,
+    #[allow(unused)]
+    pub symbols: BTreeMap<GlobalSymbol, SymbolInformation>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Document {
     pub relative_path: RelativePath,
+    #[allow(unused)]
     pub language: Arc<str>,
     pub occurrences: Vec<Occurrence>,
-    pub locals: HashMap<LocalSymbol, SymbolInformation>,
+    #[allow(unused)]
+    pub locals: BTreeMap<LocalSymbol, SymbolInformation>,
+    #[allow(unused)]
     pub position_encoding: PositionEncoding,
 }
 
@@ -60,6 +65,13 @@ impl Symbol {
             Symbol::Global(GlobalSymbol(text)) => text,
         }
     }
+
+    pub fn to_global(&self) -> Option<GlobalSymbol> {
+        match self {
+            Symbol::Global(global) => Some(global.clone()),
+            Symbol::Local(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,6 +87,7 @@ pub struct LocalId {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Occurrence {
     pub range: Range<Point>,
     pub symbol: Symbol,
@@ -86,6 +99,7 @@ pub struct Occurrence {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct SymbolInformation {
     pub symbol: Symbol,
     pub documentation: Vec<Arc<str>>,
@@ -98,14 +112,16 @@ pub struct SymbolInformation {
 
 // In SCIP this is represented as a Document, but it's cleaner to have a separate type.
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct SignatureDocumentation {
     pub language: Arc<str>,
     pub occurrences: Vec<Occurrence>,
-    pub locals: HashMap<LocalSymbol, SymbolInformation>,
+    pub locals: BTreeMap<LocalSymbol, SymbolInformation>,
     pub text: Arc<str>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Metadata {
     pub version: ProtocolVersion,
     pub tool_info: Arc<ToolInfo>,
@@ -114,6 +130,7 @@ pub struct Metadata {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct ToolInfo {
     pub name: Arc<str>,
     pub version: Arc<str>,
@@ -121,6 +138,7 @@ pub struct ToolInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Relationship {
     pub symbol: Symbol,
     pub is_reference: bool,
@@ -130,6 +148,7 @@ pub struct Relationship {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: Arc<str>,
@@ -162,11 +181,13 @@ impl Index {
 
         let index = scip::types::Index::parse_from_bytes(&buffer)
             .context("Failed to parse index from bytes")?;
+
         println!("Loaded {} SCIP documents", index.documents.len());
 
         Ok(index.into())
     }
 
+    #[allow(unused)]
     pub fn document(&self, relative_path: &RelativePath) -> Result<&Document> {
         self.documents
             .get(relative_path)
@@ -272,10 +293,10 @@ impl SymbolInformation {
 // TODO: Complain about insertion of duplicates in all use of insert below
 impl From<scip::types::Index> for Index {
     fn from(index: scip::types::Index) -> Self {
-        let mut documents = HashMap::new();
-        let mut symbols = HashMap::new();
+        let mut documents = BTreeMap::new();
+        let mut symbols = BTreeMap::new();
         for document in index.documents.into_iter() {
-            let mut locals = HashMap::new();
+            let mut locals = BTreeMap::new();
             for symbol_info in document.symbols {
                 let converted_symbol: SymbolInformation = symbol_info.into();
                 match converted_symbol.symbol.clone() {
@@ -424,7 +445,7 @@ impl From<scip::types::SymbolInformation> for SymbolInformation {
 
 impl From<scip::types::Document> for SignatureDocumentation {
     fn from(document: scip::types::Document) -> Self {
-        let mut locals = HashMap::new();
+        let mut locals = BTreeMap::new();
         for symbol_info in document.symbols.into_iter() {
             let converted_symbol: SymbolInformation = symbol_info.into();
             match converted_symbol.symbol.clone() {

@@ -4,24 +4,9 @@ version = "0.1.0"
 edition = "2021"
 default-run = "refactor"
 
-[lib]
-path = "src/lib.rs"
-
 [[bin]]
 name = "refactor"
 path = "src/refactor.rs"
-
-[[bin]]
-name = "refactor2"
-path = "src/refactor2.rs"
-
-[[bin]]
-name = "splitter"
-path = "src/splitter.rs"
-
-[[bin]]
-name = "print_tree"
-path = "src/print_tree.rs"
 
 [[bin]]
 name = "print_scip"
