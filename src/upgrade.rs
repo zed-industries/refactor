@@ -89,6 +89,14 @@ impl Refactor {
             process_imports(file, &self.use_list_query);
 
             document.occurrences.iter().for_each(|occurrence| {
+                if occurrence.symbol.text().ends_with("WindowContext#") {
+                    process_window_context_mention(
+                        file,
+                        document,
+                        occurrence,
+                        &mut fns_with_window_param,
+                    );
+                }
                 if occurrence.symbol.text().ends_with("ViewContext#") {
                     process_view_context_mention(
                         file,
@@ -132,6 +140,51 @@ impl Refactor {
         }
 
         // println!("ViewContext methods: {:?}", fns_with_window_param);
+    }
+}
+
+fn process_window_context_mention(
+    file: &mut File,
+    document: &Document,
+    occurrence: &Occurrence,
+    fns_taking_window: &mut BTreeSet<GlobalSymbol>,
+) {
+    let Ok(node) = file.find_node(&occurrence.range) else {
+        return;
+    };
+
+    for ancestor in node_ancestors(node) {
+        match ancestor.kind() {
+            // Replace "cx: &mut WindowContext" with "window: &mut Window, model: &mut AppContext"
+            "parameter" => {
+                let parameter_name =
+                    file.node_text(ancestor.child_by_field_name("pattern").unwrap());
+                let leading_underscore = if parameter_name.starts_with('_') {
+                    "_"
+                } else {
+                    ""
+                };
+
+                file.record_edit(
+                    ancestor.byte_range(),
+                    format!("{leading_underscore}window: &mut Window, {parameter_name}: &mut AppContext")
+                );
+            }
+            // Record this method so we can update calls to it in a second pass.
+            "function_item" => {
+                let name_node = ancestor.child_by_field_name("name").unwrap();
+                match document.find_occurrence(&name_node.start_position()) {
+                    Ok(occurrence) => {
+                        fns_taking_window.insert(occurrence.symbol.to_global().unwrap());
+                    }
+                    Err(error) => {
+                        println!("No occurrence found for function name: {}", error);
+                    }
+                }
+                break;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -289,10 +342,14 @@ fn move_to_window(file: &mut File, occurrence: &Occurrence, takes_cx: bool) -> R
 
 fn takes_window_fn(symbol: &GlobalSymbol) -> bool {
     // dbg!(symbol.0.as_ref());
+    //
 
     [
         "rust-analyzer cargo gpui 0.1.0 app/impl#[AppContext]open_window().",
         "rust-analyzer cargo gpui 0.1.0 elements/canvas/canvas().",
+        "rust-analyzer cargo gpui 0.1.0 elements/div/StatefulInteractiveElement#on_click().",
+        "rust-analyzer cargo gpui 0.1.0 elements/div/StatefulInteractiveElement#on_drag().",
+        "rust-analyzer cargo gpui 0.1.0 elements/div/StatefulInteractiveElement#on_hover().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]listener().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][Context]update_window().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][Context]update_window().",
@@ -314,6 +371,7 @@ fn takes_window_fn(symbol: &GlobalSymbol) -> bool {
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_window_should_close().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_measured_layout().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]subscribe().",
+
     ]
     .contains(&symbol.0.as_ref())
 }
@@ -331,6 +389,7 @@ fn moved_to_window(symbol: &GlobalSymbol) -> Option<bool> {
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]replace_root_view().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]focus_view().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]dismiss_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]use_asset().",
     ];
     let without_cx = [
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_layer().",
