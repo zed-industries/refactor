@@ -77,16 +77,15 @@ impl Refactor {
         for (relative_path, document) in focused_documents {
             println!("Processing document: {:?}", relative_path);
             let file = self.editor.file(relative_path).unwrap();
-            process_imports(file, document, &self.use_list_query);
-            process_context_locals(file, document);
+            process_imports(file, &self.use_list_query);
+            process_fn_parameters(file, document);
+            // process_context_locals(file, document);
         }
     }
 }
 
-fn process_imports(file: &mut File, document: &Document, use_list_query: &Query) {
+fn process_imports(file: &mut File, use_list_query: &Query) {
     let mut query_cursor = QueryCursor::new();
-    let import_ix = use_list_query.capture_index_for_name("import");
-    let nested_import_ix = use_list_query.capture_index_for_name("nested_import");
     let mut matches =
         query_cursor.matches(&use_list_query, file.tree.root_node(), file.text.as_bytes());
 
@@ -98,8 +97,6 @@ fn process_imports(file: &mut File, document: &Document, use_list_query: &Query)
         let mut imported_model_context = false;
         let mut imported_app_context = false;
         let mut imported_window = false;
-
-        println!("Capture node text: {}", file.node_text(capture.node));
 
         let mut cursor = capture.node.walk();
         cursor.goto_first_child();
@@ -135,7 +132,7 @@ fn process_imports(file: &mut File, document: &Document, use_list_query: &Query)
         let mut cursor = capture.node.walk();
         cursor.goto_first_child();
 
-        if dbg!(file.node_text(cursor.node()) == "{") {
+        if file.node_text(cursor.node()) == "{" {
             let insert_at = cursor.node().byte_range().end;
 
             if imported_view_context {
@@ -162,116 +159,47 @@ fn process_imports(file: &mut File, document: &Document, use_list_query: &Query)
     }
 }
 
-fn process_context_locals(file: &mut File, document: &Document) {
-    for (local, symbol_info) in document.locals.iter() {
-        match LocalInfo::compute(document, local, symbol_info, |s| {
-            s.contains("ViewContext") || s.contains("WindowContext")
-        }) {
-            Ok(Some(local_info)) => match process_context_local(file, local_info) {
-                Ok(_) => {}
-                Err(err) => println!("Error processing context local: {}", err),
-            },
-            Ok(None) => {} // Skip
-            Err(err) => println!("Error computing LocalInfo: {}", err),
+fn process_fn_parameters(file: &mut File, document: &Document) {
+    for occ in &document.occurrences {
+        let mut generics = None;
+        if occ.symbol.text().ends_with("ViewContext#") {
+            let Ok(node) = file.find_node(&occ.range) else {
+                continue;
+            };
+
+            for ancestor in node_ancestors(node) {
+                match ancestor.kind() {
+                    "generic_type" => {
+                        generics = file.node_text(ancestor).strip_prefix("ViewContext")
+                    }
+                    "parameter" => {
+                        if let Some(generics) = generics {
+                            let parameter_name =
+                                file.node_text(ancestor.child_by_field_name("pattern").unwrap());
+                            let leading_underscore = if parameter_name.starts_with('_') {
+                                "_"
+                            } else {
+                                ""
+                            };
+
+                            file.record_edit(
+                                ancestor.byte_range(),
+                                format!("{leading_underscore}window: &mut Window, {parameter_name}: &mut ModelContext{generics}")
+                            );
+                        } else {
+                            file.record_error(
+                                ancestor.range().start_point.row,
+                                "missing generics types".to_string(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            println!("{}", file.line(occ.range.start.row).unwrap());
         }
     }
-}
-
-fn process_context_local(file: &mut File, local_info: LocalInfo) -> Result<()> {
-    // Process the local_info if needed
-    //
-    println!("Local: {}", local_info.name);
-    println!(
-        "{}",
-        file.line(local_info.definition.range.start.row).unwrap()
-    );
-
-    let context_local_name = local_info.name;
-    let leading_underscore = if context_local_name.starts_with("_") {
-        "_"
-    } else {
-        ""
-    };
-
-    println!("Ancestors:");
-    let definition_node = file.find_node(&local_info.definition.range)?;
-    let ancestors = node_ancestors(definition_node);
-
-    for ancestor in ancestors {
-        println!("  {}", ancestor.kind());
-
-        match ancestor.kind() {
-            "closure_parameters" => {
-                let insert_at = definition_node.byte_range().start;
-                file.record_edit(
-                    insert_at..insert_at,
-                    format!("{leading_underscore}window, "),
-                );
-
-                break;
-            }
-            "parameter" => {
-                let new_context_type;
-                let window_type;
-
-                let type_signature = file.node_text(ancestor.child_by_field_name("type").unwrap());
-
-                if type_signature.contains("&ViewContext<Self>") {
-                    window_type = "&Window".to_string();
-                    new_context_type = format!("&ModelContext<Self>");
-                } else if type_signature.contains("&mut ViewContext<Self>") {
-                    window_type = "&mut Window".to_string();
-                    new_context_type = format!("&mut ModelContext<Self>");
-                } else if let Some(generics) = type_signature.strip_prefix("&ViewContext") {
-                    window_type = "&Window".to_string();
-                    new_context_type = format!("&ModelContext{generics}");
-                } else if let Some(generics) = type_signature.strip_prefix("&mut ViewContext") {
-                    window_type = "&mut Window".to_string();
-                    new_context_type = format!("&mut ModelContext{generics}");
-                } else if type_signature.contains("&WindowContext") {
-                    window_type = "&mut Window".to_string();
-                    new_context_type = "&AppContext".to_string();
-                } else if type_signature.contains("&mut WindowContext") {
-                    window_type = "&mut Window".to_string();
-                    new_context_type = "&mut AppContext".to_string();
-                } else {
-                    anyhow::bail!("Unsupported context type: {}", type_signature)
-                };
-
-                file.record_edit(
-                    ancestor.byte_range(),
-                    format!(
-                        "{leading_underscore}window: {window_type}, {context_local_name}: {new_context_type}"
-                    ),
-                );
-
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn process_window_context_mention(file: &mut File, occurrence: &Occurrence) -> Result<()> {
-    println!("WindowContext Mention");
-    println!("{}", file.line(occurrence.range.start.row).unwrap());
-
-    let node = file.find_node(&occurrence.range)?;
-
-    let ancestors = node_ancestors(node);
-    for ancestor in ancestors {
-        println!("  Ancestor: {}", ancestor.kind());
-        match ancestor.grammar_name() {
-            "parameter" => {
-                println!("  Parameter: {}", file.node_text(ancestor));
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
