@@ -109,12 +109,21 @@ impl Refactor {
             let file = self.editor.file(relative_path).unwrap();
 
             document.occurrences.iter().for_each(|occurrence| {
-                if occurrence.symbol_roles == 0 {
-                    if let Symbol::Global(global_symbol) = &occurrence.symbol {
-                        if fns_with_window_param.contains(global_symbol) {
-                            if let Err(err) = add_window_argument(file, occurrence) {
-                                eprintln!("Error adding window parameter: {}", err);
-                            }
+                if let Symbol::Global(global_symbol) = &occurrence.symbol {
+                    if fns_with_window_param.contains(global_symbol) {
+                        if let Err(err) = add_window_argument(file, occurrence) {
+                            eprintln!("Error adding window parameter: {}", err);
+                        }
+                    }
+
+                    if takes_window_fn(global_symbol) {
+                        println!(
+                            "Adding window parameter to function call: {:?}",
+                            occurrence.symbol
+                        );
+
+                        if let Err(err) = add_window_fn_param(file, occurrence) {
+                            eprintln!("Error adding window parameter: {}", err);
                         }
                     }
                 }
@@ -184,12 +193,6 @@ fn process_view_context_mention(
 fn add_window_argument(file: &mut File, occurrence: &Occurrence) -> Result<()> {
     let node = file.find_node(&occurrence.range)?;
 
-    println!(
-        "Occurrence symbol: {:?}\nLine: {:?}",
-        occurrence.symbol,
-        file.line(node.range().start_point.row).unwrap()
-    );
-
     for ancestor in node_ancestors(node) {
         if ancestor.kind() == "call_expression" {
             let arguments = ancestor.child_by_field_name("arguments").unwrap();
@@ -206,7 +209,51 @@ fn add_window_argument(file: &mut File, occurrence: &Occurrence) -> Result<()> {
     Ok(())
 }
 
-// fn find_occurence(document: &Document, position: scip::types::)
+fn add_window_fn_param(file: &mut File, occurrence: &Occurrence) -> Result<()> {
+    let node = file.find_node(&occurrence.range)?;
+
+    println!(
+        "Occurrence symbol: {:?}\nLine: {:?}",
+        occurrence.symbol,
+        file.line(node.range().start_point.row).unwrap()
+    );
+
+    for ancestor in node_ancestors(node) {
+        if ancestor.kind() == "call_expression" {
+            let arguments = ancestor.child_by_field_name("arguments").unwrap();
+            let mut cursor = arguments.walk();
+            for child in arguments.named_children(&mut cursor) {
+                if child.kind() == "closure_expression" {
+                    println!("Found function_expression: {:?}", file.node_text(child));
+                    let parameters = child.child_by_field_name("parameters").unwrap();
+                    let mut cursor = parameters.walk();
+
+                    let last_parameter = parameters.child(parameters.child_count() - 2).unwrap();
+                    let replacement = if file.node_text(last_parameter) == "_" {
+                        "_, "
+                    } else if file.node_text(last_parameter).starts_with("_") {
+                        "_window, "
+                    } else {
+                        "window, "
+                    };
+                    file.record_edit(
+                        last_parameter.start_byte()..last_parameter.start_byte(),
+                        replacement.to_string(),
+                    );
+                    // file.record_edit(child.byte_range(), "window, cx".to_string());
+                }
+            }
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn takes_window_fn(symbol: &GlobalSymbol) -> bool {
+    ["rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]listener()."]
+        .contains(&symbol.0.as_ref())
+}
 
 fn process_imports(file: &mut File, use_list_query: &Query) {
     let mut query_cursor = QueryCursor::new();
@@ -279,49 +326,6 @@ fn process_imports(file: &mut File, use_list_query: &Query) {
             }
         } else {
             println!("Unsupported import format");
-        }
-    }
-}
-
-fn process_fn_parameters(file: &mut File, document: &Document) {
-    for occ in &document.occurrences {
-        let mut generics = None;
-        if occ.symbol.text().ends_with("ViewContext#") {
-            let Ok(node) = file.find_node(&occ.range) else {
-                continue;
-            };
-
-            for ancestor in node_ancestors(node) {
-                match ancestor.kind() {
-                    "generic_type" => {
-                        generics = file.node_text(ancestor).strip_prefix("ViewContext")
-                    }
-                    "parameter" => {
-                        if let Some(generics) = generics {
-                            let parameter_name =
-                                file.node_text(ancestor.child_by_field_name("pattern").unwrap());
-                            let leading_underscore = if parameter_name.starts_with('_') {
-                                "_"
-                            } else {
-                                ""
-                            };
-
-                            file.record_edit(
-                                ancestor.byte_range(),
-                                format!("{leading_underscore}window: &mut Window, {parameter_name}: &mut ModelContext{generics}")
-                            );
-                        } else {
-                            file.record_error(
-                                ancestor.range().start_point.row,
-                                "missing generics types".to_string(),
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            println!("{}", file.line(occ.range.start.row).unwrap());
         }
     }
 }
