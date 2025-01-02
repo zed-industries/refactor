@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context as _, Result};
 use clap::Parser as ClapParser;
 use refactor::{file_editor::*, scip_index::*};
-use std::{iter, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, iter, path::PathBuf, sync::Arc};
 use streaming_iterator::StreamingIterator as _;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
@@ -74,15 +74,86 @@ impl Refactor {
                 && !relative_path.0.starts_with("crates/gpui/src")
         });
 
+        let mut view_cx_methods = BTreeSet::new();
+
         for (relative_path, document) in focused_documents {
             println!("Processing document: {:?}", relative_path);
             let file = self.editor.file(relative_path).unwrap();
             process_imports(file, &self.use_list_query);
-            process_fn_parameters(file, document);
-            // process_context_locals(file, document);
+
+            document.occurrences.iter().for_each(|occurrence| {
+                if occurrence.symbol.text().ends_with("ViewContext#") {
+                    process_view_context_mention(file, document, occurrence, &mut view_cx_methods);
+                }
+            });
+        }
+
+        println!("ViewContext methods: {:?}", view_cx_methods);
+    }
+}
+
+fn process_view_context_mention(
+    file: &mut File,
+    document: &Document,
+    occurrence: &Occurrence,
+    fns_taking_view_cx: &mut BTreeSet<GlobalSymbol>,
+) {
+    let Ok(node) = file.find_node(&occurrence.range) else {
+        return;
+    };
+    println!(
+        "Line: {:?}, Symbol: {:?}",
+        file.line(node.range().start_point.row),
+        occurrence.symbol.text()
+    );
+
+    let mut generics = None;
+    for ancestor in node_ancestors(node) {
+        match ancestor.kind() {
+            // Capture the <T> from ViewContext<T> for possible use later in a later loop iteration.
+            "generic_type" => {
+                generics = file.node_text(ancestor).strip_prefix("ViewContext");
+            }
+            // Replace "cx: &mut ViewContext<T>" with "window: &mut Window, model: &mut ModelContext<T>"
+            "parameter" => {
+                if let Some(generics) = generics {
+                    let parameter_name =
+                        file.node_text(ancestor.child_by_field_name("pattern").unwrap());
+                    let leading_underscore = if parameter_name.starts_with('_') {
+                        "_"
+                    } else {
+                        ""
+                    };
+
+                    file.record_edit(
+                        ancestor.byte_range(),
+                        format!("{leading_underscore}window: &mut Window, {parameter_name}: &mut ModelContext{generics}")
+                    );
+                } else {
+                    file.record_error(
+                        ancestor.range().start_point.row,
+                        "Missing generics types".to_string(),
+                    );
+                }
+            }
+            // Record this method so we can update calls to it in a second pass.
+            "function_item" => {
+                let name_node = ancestor.child_by_field_name("name").unwrap();
+                match document.find_occurrence(&name_node.start_position()) {
+                    Ok(occurrence) => {
+                        fns_taking_view_cx.insert(occurrence.symbol.to_global().unwrap());
+                    }
+                    Err(error) => {
+                        println!("No occurrence found for function name: {}", error);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
+
+// fn find_occurence(document: &Document, position: scip::types::)
 
 fn process_imports(file: &mut File, use_list_query: &Query) {
     let mut query_cursor = QueryCursor::new();
@@ -202,48 +273,44 @@ fn process_fn_parameters(file: &mut File, document: &Document) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct LocalInfo {
-    id: LocalId,
-    name: Arc<str>,
-    type_signature: Arc<str>,
-    definition: Occurrence,
-    references: Vec<Occurrence>,
-}
+// #[derive(Debug, Clone)]
+// struct LocalInfo {
+//     id: LocalId,
+//     name: Arc<str>,
+//     type_signature: Arc<str>,
+//     definition: Occurrence,
+//     references: Vec<Occurrence>,
+// }
 
-impl LocalInfo {
-    fn compute(
-        document: &Document,
-        symbol: &LocalSymbol,
-        symbol_info: &SymbolInformation,
-        signature_predicate: impl FnOnce(&str) -> bool,
-    ) -> Result<Option<LocalInfo>> {
-        let Some(signature) = symbol_info.signature_documentation.as_ref() else {
-            return Ok(None);
-        };
-        let signature = &signature.text;
-        if !signature_predicate(signature) {
-            return Ok(None);
-        }
-        let type_signature = extract_type_signature(signature)?;
+// impl LocalInfo {
+//     fn compute(
+//         document: &Document,
+//         symbol: &LocalSymbol,
+//         symbol_info: &SymbolInformation,
+//         signature_predicate: impl FnOnce(&str) -> bool,
+//     ) -> Result<Option<LocalInfo>> {
+//         let Some(signature) = symbol_info.signature_documentation.as_ref() else {
+//             return Ok(None);
+//         };
+//         let signature = &signature.text;
+//         if !signature_predicate(signature) {
+//             return Ok(None);
+//         }
+//         let type_signature = extract_type_signature(signature)?;
 
-        let (definition, references) = document.find_local_definition_and_references(symbol)?;
-        Ok(Some(LocalInfo {
-            id: LocalId {
-                relative_path: document.relative_path.clone(),
-                symbol: symbol.clone(),
-            },
-            name: symbol_info.display_name.clone(),
-            type_signature: type_signature.into(),
-            definition: definition.clone(),
-            references: references.into_iter().map(|occ| occ.clone()).collect(),
-        }))
-    }
-}
-
-fn process_view_context_mention(file: &mut File, occurrence: &Occurrence) {
-    println!("{:?}", file.line(occurrence.range.start.row).unwrap());
-}
+//         let (definition, references) = document.find_local_definition_and_references(symbol)?;
+//         Ok(Some(LocalInfo {
+//             id: LocalId {
+//                 relative_path: document.relative_path.clone(),
+//                 symbol: symbol.clone(),
+//             },
+//             name: symbol_info.display_name.clone(),
+//             type_signature: type_signature.into(),
+//             definition: definition.clone(),
+//             references: references.into_iter().map(|occ| occ.clone()).collect(),
+//         }))
+//     }
+// }
 
 fn node_ancestors(mut node: Node) -> impl Iterator<Item = Node> {
     iter::from_fn(move || {
@@ -255,12 +322,12 @@ fn node_ancestors(mut node: Node) -> impl Iterator<Item = Node> {
     })
 }
 
-fn extract_type_signature(typed_identifier: &str) -> Result<String> {
-    match typed_identifier.find(|c| c == ':') {
-        Some(colon_position) => Ok(typed_identifier[colon_position + 2..].to_owned()),
-        None => Err(anyhow!("{typed_identifier} does not contain ':'")),
-    }
-}
+// fn extract_type_signature(typed_identifier: &str) -> Result<String> {
+//     match typed_identifier.find(|c| c == ':') {
+//         Some(colon_position) => Ok(typed_identifier[colon_position + 2..].to_owned()),
+//         None => Err(anyhow!("{typed_identifier} does not contain ':'")),
+//     }
+// }
 
 // #[derive(Debug, Clone)]
 // pub struct Index {

@@ -60,6 +60,13 @@ impl Symbol {
             Symbol::Global(GlobalSymbol(text)) => text,
         }
     }
+
+    pub fn to_global(&self) -> Option<GlobalSymbol> {
+        match self {
+            Symbol::Global(global) => Some(global.clone()),
+            Symbol::Local(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
