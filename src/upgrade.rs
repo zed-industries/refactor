@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result};
 use clap::Parser as ClapParser;
 use refactor::{file_editor::*, scip_index::*};
-use std::{collections::BTreeSet, iter, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, iter, path::PathBuf};
 use streaming_iterator::StreamingIterator as _;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
@@ -117,12 +117,13 @@ impl Refactor {
                     }
 
                     if takes_window_fn(global_symbol) {
-                        println!(
-                            "Adding window parameter to function call: {:?}",
-                            occurrence.symbol
-                        );
-
                         if let Err(err) = add_window_fn_param(file, occurrence) {
+                            eprintln!("Error adding window parameter: {}", err);
+                        }
+                    }
+
+                    if let Some(takes_cx) = moved_to_window(global_symbol) {
+                        if let Err(err) = move_to_window(file, occurrence, takes_cx) {
                             eprintln!("Error adding window parameter: {}", err);
                         }
                     }
@@ -212,22 +213,13 @@ fn add_window_argument(file: &mut File, occurrence: &Occurrence) -> Result<()> {
 fn add_window_fn_param(file: &mut File, occurrence: &Occurrence) -> Result<()> {
     let node = file.find_node(&occurrence.range)?;
 
-    println!(
-        "Occurrence symbol: {:?}\nLine: {:?}",
-        occurrence.symbol,
-        file.line(node.range().start_point.row).unwrap()
-    );
-
     for ancestor in node_ancestors(node) {
         if ancestor.kind() == "call_expression" {
             let arguments = ancestor.child_by_field_name("arguments").unwrap();
             let mut cursor = arguments.walk();
             for child in arguments.named_children(&mut cursor) {
                 if child.kind() == "closure_expression" {
-                    println!("Found function_expression: {:?}", file.node_text(child));
                     let parameters = child.child_by_field_name("parameters").unwrap();
-                    let mut cursor = parameters.walk();
-
                     let last_parameter = parameters.child(parameters.child_count() - 2).unwrap();
                     let replacement = if file.node_text(last_parameter) == "_" {
                         "_, "
@@ -240,7 +232,6 @@ fn add_window_fn_param(file: &mut File, occurrence: &Occurrence) -> Result<()> {
                         last_parameter.start_byte()..last_parameter.start_byte(),
                         replacement.to_string(),
                     );
-                    // file.record_edit(child.byte_range(), "window, cx".to_string());
                 }
             }
             break;
@@ -250,9 +241,117 @@ fn add_window_fn_param(file: &mut File, occurrence: &Occurrence) -> Result<()> {
     Ok(())
 }
 
+fn move_to_window(file: &mut File, occurrence: &Occurrence, takes_cx: bool) -> Result<()> {
+    let node = file.find_node(&occurrence.range)?;
+
+    for ancestor in node_ancestors(node) {
+        if ancestor.kind() == "field_expression" {
+            let receiver = ancestor.child_by_field_name("value").unwrap();
+            file.record_edit(receiver.byte_range(), "window".to_string());
+        }
+
+        if ancestor.kind() == "call_expression" {
+            if takes_cx {
+                let arguments = ancestor.child_by_field_name("arguments").unwrap();
+                let last_child = arguments.child(arguments.child_count() - 1).unwrap();
+                if last_child.prev_sibling().map_or(false, |prev_child| {
+                    prev_child.kind() == "closure_expression"
+                }) {
+                    let insert_at = if arguments.named_child_count() == 1 {
+                        arguments.child(0).unwrap().end_byte()
+                    } else {
+                        arguments
+                            .child(arguments.child_count() - 3) // The comma before the closure
+                            .unwrap()
+                            .end_byte()
+                    };
+                    file.record_edit(insert_at..insert_at, "cx, ".to_string());
+                } else {
+                    let replacement = if arguments.named_child_count() == 0 {
+                        "cx".to_string()
+                    } else {
+                        ", cx".to_string()
+                    };
+
+                    file.record_edit(
+                        last_child.start_byte()..last_child.start_byte(),
+                        replacement,
+                    );
+                }
+            }
+
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 fn takes_window_fn(symbol: &GlobalSymbol) -> bool {
-    ["rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]listener()."]
-        .contains(&symbol.0.as_ref())
+    // dbg!(symbol.0.as_ref());
+
+    [
+        "rust-analyzer cargo gpui 0.1.0 app/impl#[AppContext]open_window().",
+        "rust-analyzer cargo gpui 0.1.0 elements/canvas/canvas().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'a, V>`]listener().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][Context]update_window().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][Context]update_window().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]new_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]defer().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]defer().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]handler_for().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]listener_for().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]observe().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]observe_global().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]observe_release().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_action().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_focus_in().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_focus_out().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_key_event().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_modifiers_changed().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_mouse_event().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_next_frame().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_window_should_close().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_measured_layout().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]subscribe().",
+    ]
+    .contains(&symbol.0.as_ref())
+}
+
+fn moved_to_window(symbol: &GlobalSymbol) -> Option<bool> {
+    let with_cx = [
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_svg().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]new_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]update_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]replace_root_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]focus_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]dismiss_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]new_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]update_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]replace_root_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]focus_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]dismiss_view().",
+    ];
+    let without_cx = [
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_layer().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_shadows().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_quad().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_path().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_underline().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_strikethrough().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_glyph().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_emoji().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_image().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_surface().",
+    ];
+
+    if with_cx.contains(&symbol.0.as_ref()) {
+        Some(true)
+    } else if without_cx.contains(&symbol.0.as_ref()) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn process_imports(file: &mut File, use_list_query: &Query) {
