@@ -17,17 +17,22 @@ use tree_sitter::Point;
 
 #[derive(Debug, Clone)]
 pub struct Index {
+    #[allow(unused)]
     pub metadata: Arc<Metadata>,
     pub documents: BTreeMap<RelativePath, Document>,
+    #[allow(unused)]
     pub symbols: BTreeMap<GlobalSymbol, SymbolInformation>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Document {
     pub relative_path: RelativePath,
+    #[allow(unused)]
     pub language: Arc<str>,
     pub occurrences: Vec<Occurrence>,
+    #[allow(unused)]
     pub locals: BTreeMap<LocalSymbol, SymbolInformation>,
+    #[allow(unused)]
     pub position_encoding: PositionEncoding,
 }
 
@@ -82,6 +87,7 @@ pub struct LocalId {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Occurrence {
     pub range: Range<Point>,
     pub symbol: Symbol,
@@ -93,6 +99,7 @@ pub struct Occurrence {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct SymbolInformation {
     pub symbol: Symbol,
     pub documentation: Vec<Arc<str>>,
@@ -105,6 +112,7 @@ pub struct SymbolInformation {
 
 // In SCIP this is represented as a Document, but it's cleaner to have a separate type.
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct SignatureDocumentation {
     pub language: Arc<str>,
     pub occurrences: Vec<Occurrence>,
@@ -113,6 +121,7 @@ pub struct SignatureDocumentation {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Metadata {
     pub version: ProtocolVersion,
     pub tool_info: Arc<ToolInfo>,
@@ -121,6 +130,7 @@ pub struct Metadata {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct ToolInfo {
     pub name: Arc<str>,
     pub version: Arc<str>,
@@ -128,6 +138,7 @@ pub struct ToolInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Relationship {
     pub symbol: Symbol,
     pub is_reference: bool,
@@ -137,6 +148,7 @@ pub struct Relationship {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: Arc<str>,
@@ -167,7 +179,7 @@ impl Index {
         file.read_to_end(&mut buffer)
             .context("Failed to read index file")?;
 
-        let mut index = scip::types::Index::parse_from_bytes(&buffer)
+        let index = scip::types::Index::parse_from_bytes(&buffer)
             .context("Failed to parse index from bytes")?;
 
         println!("Loaded {} SCIP documents", index.documents.len());
@@ -175,6 +187,7 @@ impl Index {
         Ok(index.into())
     }
 
+    #[allow(unused)]
     pub fn document(&self, relative_path: &RelativePath) -> Result<&Document> {
         self.documents
             .get(relative_path)
