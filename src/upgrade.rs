@@ -118,8 +118,10 @@ impl Refactor {
 
             document.occurrences.iter().for_each(|occurrence| {
                 if let Symbol::Global(global_symbol) = &occurrence.symbol {
-                    if fns_with_window_param.contains(global_symbol) {
-                        if let Err(err) = add_window_argument(file, occurrence) {
+                    if let Some(replace_cx) =
+                        takes_window_arg(global_symbol, &fns_with_window_param)
+                    {
+                        if let Err(err) = add_window_argument(file, occurrence, replace_cx) {
                             eprintln!("Error adding window parameter: {}", err);
                         }
                     }
@@ -244,7 +246,7 @@ fn process_view_context_mention(
     }
 }
 
-fn add_window_argument(file: &mut File, occurrence: &Occurrence) -> Result<()> {
+fn add_window_argument(file: &mut File, occurrence: &Occurrence, replace_cx: bool) -> Result<()> {
     let node = file.find_node(&occurrence.range)?;
 
     for ancestor in node_ancestors(node) {
@@ -253,7 +255,11 @@ fn add_window_argument(file: &mut File, occurrence: &Occurrence) -> Result<()> {
             let mut cursor = arguments.walk();
             for child in arguments.named_children(&mut cursor) {
                 if file.node_text(child) == "cx" {
-                    file.record_edit(child.byte_range(), "window, cx".to_string());
+                    if replace_cx {
+                        file.record_edit(child.byte_range(), "window".to_string());
+                    } else {
+                        file.record_edit(child.byte_range(), "window, cx".to_string());
+                    }
                 }
             }
             break;
@@ -307,9 +313,12 @@ fn move_to_window(file: &mut File, occurrence: &Occurrence, takes_cx: bool) -> R
             if takes_cx {
                 let arguments = ancestor.child_by_field_name("arguments").unwrap();
                 let last_child = arguments.child(arguments.child_count() - 1).unwrap();
-                if last_child.prev_sibling().map_or(false, |prev_child| {
-                    prev_child.kind() == "closure_expression"
-                }) {
+
+                if takes_window_fn(&occurrence.symbol.to_global().unwrap())
+                    || last_child.prev_sibling().map_or(false, |prev_child| {
+                        prev_child.kind() == "closure_expression"
+                    })
+                {
                     let insert_at = if arguments.named_child_count() == 1 {
                         arguments.child(0).unwrap().end_byte()
                     } else {
@@ -321,6 +330,11 @@ fn move_to_window(file: &mut File, occurrence: &Occurrence, takes_cx: bool) -> R
                     file.record_edit(insert_at..insert_at, "cx, ".to_string());
                 } else {
                     let replacement = if arguments.named_child_count() == 0 {
+                        "cx".to_string()
+                    } else if last_child
+                        .prev_sibling()
+                        .map_or(false, |prev_child| prev_child.kind() == ",")
+                    {
                         "cx".to_string()
                     } else {
                         ", cx".to_string()
@@ -340,11 +354,40 @@ fn move_to_window(file: &mut File, occurrence: &Occurrence, takes_cx: bool) -> R
     Ok(())
 }
 
-fn takes_window_fn(symbol: &GlobalSymbol) -> bool {
-    // dbg!(symbol.0.as_ref());
-    //
+fn takes_window_arg(
+    symbol: &GlobalSymbol,
+    fns_with_window_param: &BTreeSet<GlobalSymbol>,
+) -> Option<bool> {
+    let replace_cx = [
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]contains().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]dispatch_action().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]focus().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]is_focused().",
+    ];
+    let dont_replace_cx = [
+        "rust-analyzer cargo gpui 0.1.0 text_system/line/impl#[ShapedLine]paint().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]contains().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]contains_focused().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]dispatch_action().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]focus().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]is_focused().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[FocusHandle]within_focused().",
+    ];
 
+    if replace_cx.contains(&symbol.0.as_ref()) {
+        Some(true)
+    } else if dont_replace_cx.contains(&symbol.0.as_ref()) {
+        Some(false)
+    } else if fns_with_window_param.contains(symbol) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn takes_window_fn(symbol: &GlobalSymbol) -> bool {
     [
+        "rust-analyzer cargo gpui 0.1.0 app/impl#[AppContext]observe_keystrokes().",
         "rust-analyzer cargo gpui 0.1.0 app/impl#[AppContext]open_window().",
         "rust-analyzer cargo gpui 0.1.0 elements/canvas/canvas().",
         "rust-analyzer cargo gpui 0.1.0 elements/div/StatefulInteractiveElement#on_click().",
@@ -371,37 +414,184 @@ fn takes_window_fn(symbol: &GlobalSymbol) -> bool {
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_window_should_close().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_measured_layout().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]subscribe().",
-
+        "rust-analyzer cargo gpui 0.1.0 elements/uniform_list/uniform_list().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowHandle<V>`]update().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[AnyWindowHandle]update().",
     ]
     .contains(&symbol.0.as_ref())
 }
 
 fn moved_to_window(symbol: &GlobalSymbol) -> Option<bool> {
     let with_cx = [
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_svg().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]new_view().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]update_view().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]replace_root_view().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]focus_view().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]dismiss_view().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]new_view().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]update_view().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]replace_root_view().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]focus_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]focus_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]new_view().",
+        "rust-analyzer cargo gpui 0.1.0 VisualContext#new_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]replace_root_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`ViewContext<'_, V>`][VisualContext]update_view().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]dismiss_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]focus_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]new_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]replace_root_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'_>`][VisualContext]update_view().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]appearance_changed().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]defer().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_action().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_keystroke_observers().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]display().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]focused().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]handle_input().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]is_action_available().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]notify().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]observe().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]observe_global().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]observe_release().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_window_should_close().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_svg().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_svg().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]prompt().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]remove_window().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_layout().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]spawn().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]subscribe().",
+        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]to_async().",
         "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]use_asset().",
     ];
+
     let without_cx = [
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_layer().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_shadows().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_quad().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_path().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_underline().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_strikethrough().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_glyph().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_emoji().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_image().",
-        "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_surface().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]activate_window().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]all_bindings_for_input().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]appearance().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]available_actions().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]bindings_for_action().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]bindings_for_action_in().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]blur().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]bounds().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]bounds_changed().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]build_custom_prompt().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]clear_pending_keystrokes().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]complete_frame().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]compute_layout().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]content_mask().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]context_stack().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]default_prevented().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]defer_draw().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]disable_focus().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_action_on_node().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_key_down_up_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_key_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_keystroke().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_modifiers_changed_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]dispatch_mouse_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]draw().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]draw_roots().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]drop_image().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]element_offset().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]element_opacity().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]finish_dispatch_key_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]focus().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]gpu_specs().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]handle_input().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]handler_for().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]has_pending_keystrokes().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]inner_window_bounds().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]insert_hitbox().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]invalidate_character_coordinates().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]is_fullscreen().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]is_maximized().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]is_window_active().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]is_window_hovered().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]keystroke_text_for().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]layout_bounds().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]line_height().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]listener_for().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]minimize_window().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]modifiers().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]mouse_position().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_action().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_focus_in().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_focus_out().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_key_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_modifiers_changed().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_mouse_event().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]on_next_frame().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_deferred_draws().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_emoji().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_emoji().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_glyph().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_glyph().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_image().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_image().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_index().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_layer().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_layer().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_path().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_path().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_quad().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_quad().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_shadows().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_shadows().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_strikethrough().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_strikethrough().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_surface().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_surface().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_underline().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]paint_underline().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]parent_view_id().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]pending_input_changed().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]pending_input_keystrokes().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]prepaint_deferred_draws().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]prepaint_index().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]prepaint_tooltip().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]present().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]prevent_default().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]refresh().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]rem_size().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]replay_pending_input().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_animation_frame().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_autoscroll().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_decorations().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]request_measured_layout().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]reset_cursor_style().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]reuse_paint().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]reuse_prepaint().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]scale_factor().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_app_id().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_background_appearance().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_client_inset().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_cursor_style().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_focus_handle().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_key_context().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_rem_size().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_tooltip().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_view_id().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_window_edited().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]set_window_title().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]show_character_palette().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]show_window_menu().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]start_window_move().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]start_window_resize().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]take_autoscroll().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]text_style().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]text_system().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]toggle_fullscreen().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]transact().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]viewport_size().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]window_bounds().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]window_controls().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]window_decorations().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]window_handle().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_absolute_element_offset().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_content_mask().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_element_namespace().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_element_offset().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_element_opacity().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_element_state().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_optional_element_state().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_rem_size().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]with_text_style().",
+            "rust-analyzer cargo gpui 0.1.0 window/impl#[`WindowContext<'a>`]zoom_window().",
     ];
 
     if with_cx.contains(&symbol.0.as_ref()) {
